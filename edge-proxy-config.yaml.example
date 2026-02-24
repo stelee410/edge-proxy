@@ -1,0 +1,177 @@
+# Linkyun Edge Proxy 配置文件
+# 复制此文件为 edge-proxy-config.yaml 并填入实际值
+
+# Linkyun Server 地址
+server_url: "http://localhost:8080"
+
+# Edge Token（从 Agent 编辑页复制）
+edge_token: "et_your_edge_token_here"
+
+# Agent UUID（对应的 Agent UUID）
+agent_uuid: "your-agent-uuid-here"
+
+# ============================================================
+# LLM 配置 - 支持两种格式（任选其一）
+# ============================================================
+
+# --- 格式一：多 Provider 配置（推荐） ---
+# 可配置多个 LLM Provider，通过 name 标识，支持按请求切换
+llm:
+  # 默认使用的 Provider 名称
+  default: "openai-gpt4o"
+
+  # Provider 列表
+  providers:
+    # OpenAI GPT-4o
+    - name: "openai-gpt4o"
+      provider: "openai"
+      base_url: "https://api.openai.com/v1"
+      api_key: "sk-xxx"
+      model: "gpt-4o-mini"
+      temperature: 0.7
+      max_tokens: 4096
+
+    # 本地 Ollama
+    - name: "local-ollama"
+      provider: "ollama"
+      model: "llama3"
+
+    # Ollama OpenAI 兼容模式
+    - name: "local-qwen"
+      provider: "ollama-openai"
+      base_url: "http://localhost:11434/v1"
+      model: "qwen2.5:7b"
+
+    # --- 国产模型示例（均为预设，无需填写 base_url） ---
+
+    # DeepSeek
+    #- name: "my-deepseek"
+    #  provider: "deepseek"
+    #  api_key: "sk-xxx"
+    #  model: "deepseek-chat"
+
+    # 通义千问 Qwen
+    #- name: "my-qwen"
+    #  provider: "qwen"
+    #  api_key: "sk-xxx"
+    #  model: "qwen-turbo"
+
+    # 豆包 Doubao（火山引擎）
+    #- name: "my-doubao"
+    #  provider: "doubao"
+    #  api_key: "xxx"
+    #  model: "doubao-pro-32k"
+
+    # Moonshot / Kimi
+    #- name: "my-moonshot"
+    #  provider: "moonshot"
+    #  api_key: "sk-xxx"
+    #  model: "moonshot-v1-8k"
+
+    # 智谱 GLM
+    #- name: "my-zhipu"
+    #  provider: "zhipu"
+    #  api_key: "xxx"
+    #  model: "glm-4-flash"
+
+    # Claude（Anthropic 最新模型，可覆盖 base_url 如代理或自建端点）
+    #- name: "my-claude-sonnet"
+    #  provider: "claude"
+    #  base_url: "https://api.anthropic.com"   # 可选，不填则用预设；可改为代理地址
+    #  api_key: "sk-ant-xxx"
+    #  model: "claude-sonnet-4-6"           # Sonnet 4.6 均衡型（推荐）
+    #- name: "my-claude-opus"
+    #  provider: "claude"
+    #  api_key: "sk-ant-xxx"
+    #  model: "claude-opus-4-6"             # Opus 4.6 最强能力
+    #- name: "my-claude-haiku"
+    #  provider: "claude"
+    #  api_key: "sk-ant-xxx"
+    #  model: "claude-haiku-4-5-20251001"   # Haiku 4.5 最快
+
+    # Gemini
+    #- name: "my-gemini"
+    #  provider: "gemini"
+    #  api_key: "AIza..."
+    #  model: "gemini-2.0-flash"
+
+# --- 格式二：单 Provider 配置（旧格式，向后兼容） ---
+# 如果不需要多 Provider，可以使用简单的旧格式：
+#
+# llm:
+#   provider: "openai"
+#   base_url: "http://localhost:11434/v1"
+#   api_key: ""
+#   model: "qwen2.5:7b"
+#   temperature: 0.7
+#   max_tokens: 4096
+
+# ============================================================
+# Rules 配置（可选）
+# ============================================================
+#rules:
+#  enabled: true
+#  directories:
+#    - "./rules"
+
+# ============================================================
+# Skills 配置（可选）
+# ============================================================
+# Skills 支持三种类型：
+#   - prompt-based: 基于模板的 Skill（渲染 Go text/template）
+#   - prompt-api:   基于 API 调用的 Skill（发 HTTP 请求）
+#   - code:         可执行代码的 Skill（由注册的 Go handler 处理）
+#
+# code 类型示例（TTS 语音合成，在 skills/voice-tts.yaml 中定义）：
+#   name: voice-tts
+#   type: code
+#   stage: post_conversation
+#   handler: "tts"
+#   config:
+#     provider: "minimax"               # "openai" 或 "minimax"
+#     model: "speech-2.8-hd"            # MiniMax 模型
+#     voice: "male-qn-qingse"           # MiniMax 音色 ID
+#     format: "mp3"
+#     api_key: "your-minimax-api-key"   # MiniMax API Key
+#     speed: 1.0                        # 语速 [0.5, 2]
+#     vol: 1.0                          # 音量 (0, 10]
+#     pitch: 0                          # 语调 [-12, 12]
+#     emotion: ""                       # 情绪：happy, sad, angry 等
+#
+# code handler 的 api_key/base_url 留空时自动继承全局 LLM 配置（仅 openai provider）
+#
+#skills:
+#  enabled: true
+#  directory: "./skills"
+
+# ============================================================
+# MCP 配置（可选）
+# ============================================================
+#mcp:
+#  enabled: true
+#  servers:
+#    # 文件系统 MCP 服务器（stdio 模式）
+#    - name: "filesystem"
+#      transport: "stdio"
+#      command: "npx"
+#      args: ["-y", "@modelcontextprotocol/server-filesystem", "./docs"]
+#      resources:
+#        auto_inject: true   # 自动注入所有资源到 LLM 上下文
+#        max_size: 10240     # 单个资源最大 10KB
+#        cache_ttl: 300      # 缓存 5 分钟
+#
+#    # 远程 MCP 服务器（SSE 模式）
+#    - name: "web-search"
+#      transport: "sse"
+#      url: "http://localhost:3001/sse"
+#      headers:
+#        Authorization: "Bearer your-token"
+
+# 心跳间隔（默认 15s）
+heartbeat_interval: 15s
+
+# 长轮询超时（默认 30s）
+poll_timeout: 30s
+
+# 日志级别：debug, info, warn, error
+log_level: "info"

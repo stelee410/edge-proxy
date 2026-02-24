@@ -1,0 +1,40 @@
+# 构建产物
+/edge-proxy
+/edge-proxy.exe
+*.exe
+*.dll
+*.so
+*.dylib
+
+# 含敏感信息的配置文件（保留 .example 模板）
+edge-proxy-config.yaml
+
+# 测试与覆盖率
+*.test
+*.out
+coverage.html
+coverage.txt
+*.prof
+
+# 依赖与缓存
+/vendor/
+
+# IDE / 编辑器
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# 日志
+*.log
+logs/
+
+# 临时文件
+tmp/
+temp/
+*.tmp
