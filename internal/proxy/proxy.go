@@ -112,6 +112,8 @@ type Proxy struct {
 	running         bool
 	requestCount    int
 	errorCount      int
+	statsCollector  *StatsCollector   // 统计收集器
+	statsChan       chan<- ProxyStats // 统计数据通道
 }
 
 // New 创建 Proxy 实例
@@ -130,6 +132,7 @@ func New(cfg *config.Config, registry *llm.Registry) *Proxy {
 		httpClient: &http.Client{
 			Timeout: cfg.PollTimeout + 10*time.Second,
 		},
+		statsCollector: NewStatsCollector(),
 	}
 }
 
@@ -177,6 +180,24 @@ func (p *Proxy) EnsureToolExecutor() {
 	}
 }
 
+// SetStatsChannel 设置统计数据通道
+func (p *Proxy) SetStatsChannel(ch chan<- ProxyStats) {
+	p.statsChan = ch
+}
+
+// publishStats 发布统计数据（非阻塞）
+func (p *Proxy) publishStats() {
+	if p.statsChan != nil {
+		stats := p.statsCollector.GetStats()
+		select {
+		case p.statsChan <- stats:
+			// 发送成功
+		default:
+			// 通道满时丢弃
+		}
+	}
+}
+
 
 // Run 启动代理主循环
 func (p *Proxy) Run(ctx context.Context) error {
@@ -192,10 +213,18 @@ func (p *Proxy) Run(ctx context.Context) error {
 	}
 	defer p.disconnect(ctx)
 
+	// 更新连接状态
+	p.statsCollector.SetConnected(true)
+	p.publishStats()
+
 	p.running = true
 	logger.Info("Connected successfully, entering main loop")
 
 	go p.heartbeatLoop(ctx)
+
+	// 定期发布统计信息
+	statsTicker := time.NewTicker(2 * time.Second)
+	defer statsTicker.Stop()
 
 	retryDelay := 2 * time.Second
 	maxRetryDelay := 30 * time.Second
@@ -204,8 +233,13 @@ func (p *Proxy) Run(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
 			logger.Info("Shutting down (processed %d requests, %d errors)", p.requestCount, p.errorCount)
+			p.statsCollector.SetConnected(false)
+			p.publishStats()
 			p.running = false
 			return nil
+		case <-statsTicker.C:
+			// 定期推送统计数据
+			p.publishStats()
 		default:
 			if err := p.pollAndProcess(ctx); err != nil {
 				logger.Warn("Poll error: %v (retry in %s)", err, retryDelay)
@@ -495,6 +529,13 @@ func (p *Proxy) selectProvider(requestModel string) (llm.Provider, error) {
 // 流程: Pre Skills → Rules注入 → LLM(+Tool Calling循环) → Post Skills → 响应
 func (p *Proxy) handleRequest(ctx context.Context, req *EdgeRequest) {
 	start := time.Now()
+	var success bool
+	defer func() {
+		elapsed := time.Since(start)
+		p.statsCollector.RecordRequest(success, elapsed)
+		p.publishStats()
+	}()
+
 	edgeResp := &EdgeResponse{
 		RequestID: req.RequestID,
 		AgentUUID: req.AgentUUID,
@@ -711,6 +752,7 @@ func (p *Proxy) handleRequest(ctx context.Context, req *EdgeRequest) {
 		edgeResp.Metadata["memory_actions"] = memoryActions
 	}
 	p.submitResponse(ctx, edgeResp)
+	success = true // 标记请求成功
 	if edgeResp.AudioBase64 != "" {
 		logger.Info("Request %s completed: provider=%s model=%s tokens=%d elapsed=%s (with audio)",
 			req.RequestID, provider.Name(), finalModel, totalTokens, elapsed)

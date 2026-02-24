@@ -9,6 +9,7 @@ import (
 	"strings"
 	"syscall"
 
+	tea "github.com/charmbracelet/bubbletea"
 	"linkyun-edge-proxy/internal/config"
 	"linkyun-edge-proxy/internal/llm"
 	"linkyun-edge-proxy/internal/logger"
@@ -16,6 +17,7 @@ import (
 	"linkyun-edge-proxy/internal/proxy"
 	"linkyun-edge-proxy/internal/rules"
 	"linkyun-edge-proxy/internal/skills"
+	"linkyun-edge-proxy/internal/tui"
 )
 
 func main() {
@@ -28,7 +30,16 @@ func main() {
 		os.Exit(1)
 	}
 
+	// 创建通信通道
+	logChan := make(chan logger.LogEntry, 1000)
+	statsChan := make(chan proxy.ProxyStats, 100)
+
+	// 初始化日志缓冲器
+	logger.InitBuffer(10000, logChan)
 	logger.SetLevel(cfg.LogLevel)
+
+	// 禁用标准输出，所有日志只通过 channel 发送到 TUI
+	logger.DisableStdout()
 
 	logger.Info("Linkyun Edge Proxy starting...")
 	logger.Info("Agent UUID: %s", cfg.AgentUUID)
@@ -50,6 +61,7 @@ func main() {
 		strings.Join(registry.ProviderNames(), ", "), registry.DefaultName())
 
 	p := proxy.New(cfg, registry)
+	p.SetStatsChannel(statsChan)
 
 	// 初始化 Rules 引擎（如果配置启用）
 	if cfg.Rules.Enabled && len(cfg.Rules.Directories) > 0 {
@@ -88,6 +100,7 @@ func main() {
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
 	// 启动 Rules 热加载（如果启用）
 	if cfg.Rules.Enabled && len(cfg.Rules.Directories) > 0 && p.GetRulesEngine() != nil {
@@ -115,28 +128,62 @@ func main() {
 				mcpManager.ServerCount(), len(mcpManager.GetAllTools()))
 		}
 	}
-	defer func() {
-		if mcpManager != nil {
-			mcpManager.Shutdown()
-		}
+	// 启动 Proxy 在后台 goroutine
+	proxyDone := make(chan struct{})
+	var proxyErr error
+	go func() {
+		proxyErr = p.Run(ctx)
+		close(proxyDone) // 用 close 而不是发送值，这样多处都能收到
 	}()
-	defer cancel()
 
-	// 优雅退出
+	// 启动 Bubble Tea TUI（主线程）
+	tuiModel := tui.NewModel(logChan, statsChan, cfg)
+	program := tea.NewProgram(
+		tuiModel,
+		tea.WithAltScreen(),
+		tea.WithMouseCellMotion(),
+	)
+
+	// 信号处理
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 
 	go func() {
-		<-quit
-		logger.Info("Received shutdown signal")
-		cancel()
+		select {
+		case <-quit:
+			logger.Info("Received shutdown signal")
+			program.Quit()
+			cancel()
+		case <-proxyDone:
+			if proxyErr != nil {
+				logger.Error("Proxy exited with error: %v", proxyErr)
+			}
+			program.Quit()
+		}
 	}()
 
-	if err := p.Run(ctx); err != nil {
-		logger.Error("Proxy exited with error: %v", err)
+	// 运行 TUI（阻塞）
+	if finalModel, err := program.Run(); err != nil {
+		fmt.Fprintf(os.Stderr, "TUI error: %v\n", err)
+		cancel()
+		<-proxyDone
+		if mcpManager != nil {
+			mcpManager.Shutdown()
+		}
 		os.Exit(1)
+	} else {
+		if m, ok := finalModel.(tui.Model); ok && m.IsQuit() {
+			cancel()
+		}
 	}
-	logger.Info("Edge Proxy stopped.")
+
+	// 等待 Proxy 优雅退出
+	<-proxyDone
+
+	// MCP 清理
+	if mcpManager != nil {
+		mcpManager.Shutdown()
+	}
 }
 
 // buildGlobalSkillConfig 构建全局配置 map，供 code skill handler 做 fallback
