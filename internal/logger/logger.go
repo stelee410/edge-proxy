@@ -42,7 +42,7 @@ func Debug(format string, args ...interface{}) {
 	if currentLevel <= DEBUG {
 		msg := fmt.Sprintf(format, args...)
 		if enableStdout {
-			log.Printf("[DEBUG] " + msg)
+			log.Println("[DEBUG] " + msg)
 		}
 
 		// 添加到缓冲器
@@ -57,7 +57,7 @@ func Info(format string, args ...interface{}) {
 	if currentLevel <= INFO {
 		msg := fmt.Sprintf(format, args...)
 		if enableStdout {
-			log.Printf("[INFO]  " + msg)
+			log.Println("[INFO]  " + msg)
 		}
 
 		// 添加到缓冲器
@@ -72,7 +72,7 @@ func Warn(format string, args ...interface{}) {
 	if currentLevel <= WARN {
 		msg := fmt.Sprintf(format, args...)
 		if enableStdout {
-			log.Printf("[WARN]  " + msg)
+			log.Println("[WARN]  " + msg)
 		}
 
 		// 添加到缓冲器
@@ -87,7 +87,7 @@ func Error(format string, args ...interface{}) {
 	if currentLevel <= ERROR {
 		msg := fmt.Sprintf(format, args...)
 		if enableStdout {
-			log.Printf("[ERROR] " + msg)
+			log.Println("[ERROR] " + msg)
 		}
 
 		// 添加到缓冲器

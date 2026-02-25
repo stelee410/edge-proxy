@@ -10,6 +10,8 @@ import (
 	"syscall"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"linkyun-edge-proxy/internal/chat"
+	"linkyun-edge-proxy/internal/commands"
 	"linkyun-edge-proxy/internal/config"
 	"linkyun-edge-proxy/internal/llm"
 	"linkyun-edge-proxy/internal/logger"
@@ -18,6 +20,7 @@ import (
 	"linkyun-edge-proxy/internal/rules"
 	"linkyun-edge-proxy/internal/skills"
 	"linkyun-edge-proxy/internal/tui"
+	builtinCmds "linkyun-edge-proxy/internal/commands/builtin"
 )
 
 func main() {
@@ -136,8 +139,24 @@ func main() {
 		close(proxyDone) // 用 close 而不是发送值，这样多处都能收到
 	}()
 
-	// 启动 Bubble Tea TUI（主线程）
-	tuiModel := tui.NewModel(logChan, statsChan, cfg)
+	// 初始化聊天管理器
+	chatManager := chat.NewManager(nil)
+	// 创建默认会话
+	if _, err := chatManager.CreateSession("Default"); err != nil {
+		logger.Warn("Failed to create default session: %v", err)
+	}
+
+	// 初始化命令注册表
+	cmdRegistry := commands.NewRegistry(
+		commands.WithPrefix("/"),
+		commands.WithFuzzyMatch(true),
+	)
+
+	// 注册内置命令
+	builtinCmds.RegisterBuiltinCommands(cmdRegistry, chatManager, nil, cfg)
+
+	// 启动 Bubble Tea TUI（主线程）- 使用增强型模型
+	tuiModel := tui.NewEnhancedModel(logChan, statsChan, cfg, chatManager, cmdRegistry)
 	program := tea.NewProgram(
 		tuiModel,
 		tea.WithAltScreen(),
@@ -172,7 +191,8 @@ func main() {
 		}
 		os.Exit(1)
 	} else {
-		if m, ok := finalModel.(tui.Model); ok && m.IsQuit() {
+		// 检查是否是用户主动退出
+		if enhancedModel, ok := finalModel.(*tui.EnhancedModel); ok && enhancedModel.IsQuit() {
 			cancel()
 		}
 	}
