@@ -126,7 +126,7 @@ func (s *PromptAPISkill) Execute(_ context.Context, input *SkillInput) (*SkillOu
 
 	// 如果有 response_template，渲染响应
 	content := respBody
-	if s.config.APIHeaders != nil {
+	if s.config.ResponseTemplate != "" {
 		// 尝试将 JSON 响应解析为 map，用于模板渲染
 		var respData map[string]interface{}
 		if json.Unmarshal([]byte(respBody), &respData) == nil {
@@ -134,6 +134,11 @@ func (s *PromptAPISkill) Execute(_ context.Context, input *SkillInput) (*SkillOu
 			for k, v := range respData {
 				data[k] = v
 			}
+		}
+		// 渲染响应模板
+		rendered, err := RenderTemplate(s.config.ResponseTemplate, data)
+		if err == nil {
+			content = rendered
 		}
 	}
 

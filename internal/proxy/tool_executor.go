@@ -4,10 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
+	"time"
 
 	"linkyun-edge-proxy/internal/llm"
 	"linkyun-edge-proxy/internal/logger"
 	"linkyun-edge-proxy/internal/mcp"
+	"linkyun-edge-proxy/internal/sandbox"
 	"linkyun-edge-proxy/internal/skills"
 )
 
@@ -37,6 +40,7 @@ type ToolExecutor struct {
 	skillRegistry *skills.Registry
 	mcpManager    *mcp.Manager
 	memoryAPI     EdgeMemoryAPI
+	sandbox       sandbox.Executor
 }
 
 // NewToolExecutor 创建 Tool 执行器
@@ -54,6 +58,11 @@ func (te *ToolExecutor) SetMCPManager(mgr *mcp.Manager) {
 // SetMemoryAPI 设置 Edge Memory API 客户端（用于 save_memory/delete_memory 工具）
 func (te *ToolExecutor) SetMemoryAPI(api EdgeMemoryAPI) {
 	te.memoryAPI = api
+}
+
+// SetSandbox 设置 Bash 沙箱执行器（用于 run_shell 工具）
+func (te *ToolExecutor) SetSandbox(sb sandbox.Executor) {
+	te.sandbox = sb
 }
 
 // Execute 执行一组 tool calls，返回对应的 tool results
@@ -104,6 +113,50 @@ func (te *ToolExecutor) executeOne(ctx context.Context, tc llm.ToolCall) llm.Too
 		if err != nil {
 			return llm.ToolResult{ToolCallID: tc.ID, Content: fmt.Sprintf("Error: %v", err), IsError: true}
 		}
+		return llm.ToolResult{ToolCallID: tc.ID, Content: content}
+	}
+
+	// 内置 run_shell 工具（需沙箱启用）
+	if tc.Name == "run_shell" {
+		if te.sandbox == nil {
+			return llm.ToolResult{
+				ToolCallID: tc.ID,
+				Content:    "Error: sandbox is not enabled, run_shell is unavailable",
+				IsError:    true,
+			}
+		}
+		command := getStr(tc.Arguments, "command")
+		if command == "" {
+			return llm.ToolResult{ToolCallID: tc.ID, Content: "Error: command is required", IsError: true}
+		}
+		timeoutSec := 0
+		if v, ok := tc.Arguments["timeout_seconds"]; ok {
+			switch n := v.(type) {
+			case float64:
+				timeoutSec = int(n)
+			case int:
+				timeoutSec = n
+			}
+		}
+		cwd := getStr(tc.Arguments, "cwd")
+		var timeout time.Duration
+		if timeoutSec > 0 {
+			timeout = time.Duration(timeoutSec) * time.Second
+		}
+		stdout, stderr, exitCode, err := te.sandbox.Run(ctx, command, cwd, timeout)
+		if err != nil {
+			logger.Warn("run_shell failed: %v", err)
+			return llm.ToolResult{
+				ToolCallID: tc.ID,
+				Content:    fmt.Sprintf("Error: %v", err),
+				IsError:    true,
+			}
+		}
+		content := stdout
+		if stderr != "" {
+			content += "\nstderr:\n" + stderr
+		}
+		content += "\nexit_code: " + strconv.Itoa(exitCode)
 		return llm.ToolResult{ToolCallID: tc.ID, Content: content}
 	}
 
@@ -214,6 +267,30 @@ func (te *ToolExecutor) executeDeleteMemory(ctx context.Context, info *EdgeReqIn
 	return msg, nil
 }
 
+// runShellToolDefinition run_shell 工具定义
+var runShellToolDefinition = llm.ToolDefinition{
+	Name:        "run_shell",
+	Description: "Execute a single bash command in a sandbox. Use for file operations, git, npm, listing files, running scripts within the sandbox work directory. Do not run commands that modify system files or require network to download and execute code.",
+	InputSchema: map[string]interface{}{
+		"type": "object",
+		"properties": map[string]interface{}{
+			"command": map[string]interface{}{
+				"type":        "string",
+				"description": "The bash command to run (e.g. 'ls -la', 'git status', 'cat file.txt'). Dangerous commands are blocked by blacklist.",
+			},
+			"timeout_seconds": map[string]interface{}{
+				"type":        "integer",
+				"description": "Optional. Max execution time in seconds. If omitted, sandbox default is used.",
+			},
+			"cwd": map[string]interface{}{
+				"type":        "string",
+				"description": "Optional. Subdirectory under sandbox work_dir to run the command in.",
+			},
+		},
+		"required": []string{"command"},
+	},
+}
+
 // memoryToolDefinitions 内置 memory 工具定义
 var memoryToolDefinitions = []llm.ToolDefinition{
 	{
@@ -287,6 +364,11 @@ func (te *ToolExecutor) GetToolDefinitions(memoryEnabled bool) []llm.ToolDefinit
 	// 内置 memory 工具
 	if memoryEnabled {
 		tools = append(tools, memoryToolDefinitions...)
+	}
+
+	// 内置 run_shell 工具（沙箱启用时）
+	if te.sandbox != nil {
+		tools = append(tools, runShellToolDefinition)
 	}
 
 	if len(tools) == 0 {

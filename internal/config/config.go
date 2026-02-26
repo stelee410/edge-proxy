@@ -17,10 +17,11 @@ type Config struct {
 	EdgeToken string `yaml:"edge_token"` // Edge Token
 	AgentUUID string `yaml:"agent_uuid"` // Agent UUID
 
-	LLM    LLMConfig    `yaml:"llm"`    // LLM 配置
-	Rules  RulesConfig  `yaml:"rules"`  // Rules 配置
-	Skills SkillsConfig `yaml:"skills"` // Skills 配置
-	MCP    MCPConfig    `yaml:"mcp"`    // MCP 配置
+	LLM     LLMConfig     `yaml:"llm"`     // LLM 配置
+	Rules   RulesConfig   `yaml:"rules"`   // Rules 配置
+	Skills  SkillsConfig  `yaml:"skills"`  // Skills 配置
+	MCP     MCPConfig     `yaml:"mcp"`     // MCP 配置
+	Sandbox SandboxConfig `yaml:"sandbox"` // Bash 沙箱配置（run_shell 工具）
 
 	HeartbeatInterval time.Duration `yaml:"heartbeat_interval"` // 心跳间隔
 	PollTimeout       time.Duration `yaml:"poll_timeout"`       // 轮询超时
@@ -43,6 +44,15 @@ type SkillsConfig struct {
 type MCPConfig struct {
 	Enabled bool               `yaml:"enabled"` // 是否启用 MCP
 	Servers []mcp.ServerConfig `yaml:"servers"` // MCP 服务器列表
+}
+
+// SandboxConfig Bash 沙箱配置（用于 run_shell 工具）
+type SandboxConfig struct {
+	Enabled        bool     `yaml:"enabled"`          // 是否启用沙箱（暴露 run_shell 工具）
+	WorkDir        string   `yaml:"work_dir"`          // 沙箱工作目录，为空时使用默认
+	TimeoutSeconds int      `yaml:"timeout_seconds"`   // 单次执行超时（秒），默认 30
+	BashCommand    string   `yaml:"bash_command"`     // bash 可执行路径，如 "bash"、"wsl" 或 Git Bash 路径，为空时用 "bash"
+	ExtraBlacklist []string `yaml:"extra_blacklist"`   // 额外黑名单模式（子串匹配），与内置危险命令一起生效
 }
 
 // LLMConfig LLM 配置，同时支持新旧两种格式

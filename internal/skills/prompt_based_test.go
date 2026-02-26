@@ -2,8 +2,6 @@ package skills
 
 import (
 	"context"
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -134,8 +132,8 @@ type: prompt-api
 description: Skill two
 api_url: "https://example.com/api"
 `
-	os.WriteFile(filepath.Join(dir, "skill1.yaml"), []byte(skill1), 0644)
-	os.WriteFile(filepath.Join(dir, "skill2.yaml"), []byte(skill2), 0644)
+	writeSkillSubdir(t, dir, "skill1", skill1)
+	writeSkillSubdir(t, dir, "skill2", skill2)
 
 	registry := NewRegistry()
 	count, err := LoadAndRegisterSkills(dir, registry, nil)

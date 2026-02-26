@@ -59,27 +59,28 @@ type SkillDefinition struct {
 	Enabled         bool            `json:"enabled" yaml:"enabled"`
 }
 
-// SkillConfig 从 YAML 文件加载的 Skill 配置
+// SkillConfig 从 SKILL.yaml / SKILL.json / SKILL.md 加载的 Skill 配置
 type SkillConfig struct {
-	Name            string                 `yaml:"name"`
-	Description     string                 `yaml:"description"`
-	DescriptionLLM  string                 `yaml:"description_for_llm"`
-	Stage           string                 `yaml:"stage"`
-	Type            string                 `yaml:"type"`
-	Enabled         *bool                  `yaml:"enabled"`
-	InputSchema     map[string]interface{} `yaml:"input_schema"`
+	Name            string                 `yaml:"name" json:"name"`
+	Description     string                 `yaml:"description" json:"description"`
+	DescriptionLLM  string                 `yaml:"description_for_llm" json:"description_for_llm"`
+	Stage           string                 `yaml:"stage" json:"stage"`
+	Type            string                 `yaml:"type" json:"type"`
+	Enabled         *bool                  `yaml:"enabled" json:"enabled"`
+	InputSchema     map[string]interface{} `yaml:"input_schema" json:"input_schema"`
 
 	// prompt-based 相关
-	PromptTemplate  string                 `yaml:"prompt_template"`
+	PromptTemplate string `yaml:"prompt_template" json:"prompt_template"`
 
 	// prompt-api 相关
-	APIURL          string                 `yaml:"api_url"`
-	APIMethod       string                 `yaml:"api_method"`
-	APIHeaders      map[string]string      `yaml:"api_headers"`
+	APIURL           string            `yaml:"api_url" json:"api_url"`
+	APIMethod        string            `yaml:"api_method" json:"api_method"`
+	APIHeaders       map[string]string `yaml:"api_headers" json:"api_headers"`
+	ResponseTemplate string            `yaml:"response_template" json:"response_template"`
 
 	// code 类型相关
-	Handler string                 `yaml:"handler"` // handler 名称，映射到注册的 Go handler
-	Config  map[string]interface{} `yaml:"config"`  // handler 配置参数
+	Handler string                 `yaml:"handler" json:"handler"` // handler 名称，映射到注册的 Go handler
+	Config  map[string]interface{} `yaml:"config" json:"config"`     // handler 配置参数
 }
 
 // IsEnabled 返回 Skill 是否启用，默认为 true

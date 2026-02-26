@@ -20,6 +20,7 @@ import (
 	"linkyun-edge-proxy/internal/logger"
 	"linkyun-edge-proxy/internal/mcp"
 	"linkyun-edge-proxy/internal/rules"
+	"linkyun-edge-proxy/internal/sandbox"
 	"linkyun-edge-proxy/internal/skills"
 )
 
@@ -164,6 +165,13 @@ func (p *Proxy) GetSkillPipeline() *skills.Pipeline {
 func (p *Proxy) SetMCPManager(mgr *mcp.Manager) {
 	if p.toolExecutor != nil {
 		p.toolExecutor.SetMCPManager(mgr)
+	}
+}
+
+// SetSandbox 设置 Bash 沙箱到 ToolExecutor（用于 run_shell 工具）
+func (p *Proxy) SetSandbox(sb sandbox.Executor) {
+	if p.toolExecutor != nil && sb != nil {
+		p.toolExecutor.SetSandbox(sb)
 	}
 }
 
@@ -414,7 +422,7 @@ func (p *Proxy) pollAndProcess(ctx context.Context) error {
 
 	logger.Info("Received request: id=%s type=%s messages=%d", edgeReq.RequestID, edgeReq.Type, len(edgeReq.Messages))
 	p.requestCount++
-	go p.handleRequest(ctx, &edgeReq)
+	go p.handleRequest(ctx, &edgeReq, nil)
 	return nil
 }
 
@@ -525,9 +533,20 @@ func (p *Proxy) selectProvider(requestModel string) (llm.Provider, error) {
 	return p.llmRegistry.Default()
 }
 
+// responseSink 本地测试时用于接收响应，nil 时使用 submitResponse 提交到服务器
+type responseSink func(ctx context.Context, resp *EdgeResponse)
+
 // handleRequest 处理单个请求，支持三阶段 Skill 管道和 tool calling 循环
 // 流程: Pre Skills → Rules注入 → LLM(+Tool Calling循环) → Post Skills → 响应
-func (p *Proxy) handleRequest(ctx context.Context, req *EdgeRequest) {
+// 若 sink 非 nil，将响应交给 sink 而非提交到服务器（用于本地聊天测试）
+func (p *Proxy) handleRequest(ctx context.Context, req *EdgeRequest, sink responseSink) {
+	submit := func(ctx context.Context, resp *EdgeResponse) {
+		if sink != nil {
+			sink(ctx, resp)
+		} else {
+			p.submitResponse(ctx, resp)
+		}
+	}
 	start := time.Now()
 	var success bool
 	defer func() {
@@ -552,7 +571,7 @@ func (p *Proxy) handleRequest(ctx context.Context, req *EdgeRequest) {
 		logger.Error("Request %s: no LLM provider available: %v", req.RequestID, err)
 		edgeResp.Success = false
 		edgeResp.Error = fmt.Sprintf("no LLM provider available: %v", err)
-		p.submitResponse(ctx, edgeResp)
+		submit(ctx, edgeResp)
 		return
 	}
 
@@ -574,7 +593,7 @@ func (p *Proxy) handleRequest(ctx context.Context, req *EdgeRequest) {
 		logger.Error("Request %s: build messages failed: %v", req.RequestID, err)
 		edgeResp.Success = false
 		edgeResp.Error = fmt.Sprintf("failed to process attachments: %v", err)
-		p.submitResponse(ctx, edgeResp)
+		submit(ctx, edgeResp)
 		return
 	}
 
@@ -642,7 +661,7 @@ func (p *Proxy) handleRequest(ctx context.Context, req *EdgeRequest) {
 				req.RequestID, provider.Name(), round, time.Since(start), err)
 			edgeResp.Success = false
 			edgeResp.Error = fmt.Sprintf("LLM error: %v", err)
-			p.submitResponse(ctx, edgeResp)
+			submit(ctx, edgeResp)
 			p.errorCount++
 			return
 		}
@@ -684,7 +703,7 @@ func (p *Proxy) handleRequest(ctx context.Context, req *EdgeRequest) {
 			logger.Warn("Request %s: tool calling exceeded max rounds (%d)", req.RequestID, maxToolCallingRounds)
 			edgeResp.Success = false
 			edgeResp.Error = fmt.Sprintf("tool calling exceeded max rounds (%d)", maxToolCallingRounds)
-			p.submitResponse(ctx, edgeResp)
+			submit(ctx, edgeResp)
 			p.errorCount++
 			return
 		}
@@ -751,7 +770,7 @@ func (p *Proxy) handleRequest(ctx context.Context, req *EdgeRequest) {
 		}
 		edgeResp.Metadata["memory_actions"] = memoryActions
 	}
-	p.submitResponse(ctx, edgeResp)
+	submit(ctx, edgeResp)
 	success = true // 标记请求成功
 	if edgeResp.AudioBase64 != "" {
 		logger.Info("Request %s completed: provider=%s model=%s tokens=%d elapsed=%s (with audio)",
@@ -806,6 +825,25 @@ func (p *Proxy) submitResponse(ctx context.Context, resp *EdgeResponse) {
 		}
 	}
 	logger.Error("Failed to submit response %s after %d attempts", resp.RequestID, maxAttempts)
+}
+
+// CompleteLocal 在本地执行一次完整请求（Pre/Mid/Post Skills + LLM + Tool Calling），不提交到服务器。
+// 用于 TUI 聊天界面本地测试 Skill 与对话流程。ctx 超时控制整体执行时间。
+func (p *Proxy) CompleteLocal(ctx context.Context, req *EdgeRequest) (*EdgeResponse, error) {
+	ch := make(chan *EdgeResponse, 1)
+	sink := func(_ context.Context, resp *EdgeResponse) {
+		select {
+		case ch <- resp:
+		default:
+		}
+	}
+	go p.handleRequest(ctx, req, sink)
+	select {
+	case resp := <-ch:
+		return resp, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 }
 
 // edgeMemoryItem 服务端返回的 memory 项（仅解析需要的字段）

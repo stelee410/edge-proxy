@@ -191,10 +191,9 @@ stage: pre_conversation
 type: prompt-based
 description: Skill three
 `
-	os.WriteFile(filepath.Join(dir, "skill1.yaml"), []byte(skill1), 0644)
-	os.WriteFile(filepath.Join(dir, "skill2.yaml"), []byte(skill2), 0644)
-	os.WriteFile(filepath.Join(dir, "skill3.yml"), []byte(skill3), 0644)
-	os.WriteFile(filepath.Join(dir, "readme.md"), []byte("# README"), 0644)
+	writeSkillSubdir(t, dir, "skill1", skill1)
+	writeSkillSubdir(t, dir, "skill2", skill2)
+	writeSkillSubdir(t, dir, "skill3", skill3)
 
 	configs, err := LoadSkillsFromDirectory(dir)
 	if err != nil {
@@ -204,6 +203,21 @@ description: Skill three
 	// skill2 is disabled, so only 2 configs
 	if len(configs) != 2 {
 		t.Errorf("expected 2 enabled skills, got %d", len(configs))
+	}
+}
+
+// writeSkillSubdir 在父目录下创建 skill 子目录，包含 README.md 和 SKILL.yaml
+func writeSkillSubdir(t *testing.T, parentDir, subdirName, skillYAML string) {
+	t.Helper()
+	subdir := filepath.Join(parentDir, subdirName)
+	if err := os.MkdirAll(subdir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(subdir, "README.md"), []byte("# "+subdirName), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(subdir, "SKILL.yaml"), []byte(skillYAML), 0644); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -244,14 +258,15 @@ stage: mid_conversation
 type: prompt-based
 description: No name field
 `
-	path := filepath.Join(dir, "auto-named.yaml")
+	path := filepath.Join(dir, "SKILL.yaml")
 	os.WriteFile(path, []byte(skill), 0644)
 
 	cfg, err := LoadSkillConfig(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Name != "auto-named" {
-		t.Errorf("expected name 'auto-named' from filename, got %q", cfg.Name)
+	// 无 name 时从文件名推断为 "SKILL"，不是 "auto-named"
+	if cfg.Name != "SKILL" {
+		t.Errorf("expected name 'SKILL' from filename, got %q", cfg.Name)
 	}
 }

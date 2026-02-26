@@ -18,6 +18,7 @@ import (
 	"linkyun-edge-proxy/internal/mcp"
 	"linkyun-edge-proxy/internal/proxy"
 	"linkyun-edge-proxy/internal/rules"
+	"linkyun-edge-proxy/internal/sandbox"
 	"linkyun-edge-proxy/internal/skills"
 	"linkyun-edge-proxy/internal/tui"
 	builtinCmds "linkyun-edge-proxy/internal/commands/builtin"
@@ -95,6 +96,23 @@ func main() {
 	// 确保 ToolExecutor 存在（当 Skills 未启用时，用于 MCP 等工具）
 	p.EnsureToolExecutor()
 
+	// 初始化 Bash 沙箱（若配置启用，则暴露 run_shell 工具）
+	if cfg.Sandbox.Enabled {
+		sbCfg := sandbox.Config{
+			WorkDir:        cfg.Sandbox.WorkDir,
+			TimeoutSeconds: cfg.Sandbox.TimeoutSeconds,
+			BashCommand:    cfg.Sandbox.BashCommand,
+			ExtraBlacklist: cfg.Sandbox.ExtraBlacklist,
+		}
+		sb, err := sandbox.New(sbCfg)
+		if err != nil {
+			logger.Warn("Failed to init sandbox: %v", err)
+		} else {
+			p.SetSandbox(sb)
+			logger.Info("Sandbox enabled: run_shell tool available")
+		}
+	}
+
 	// 初始化 MCP 管理器（如果配置启用）
 	var mcpManager *mcp.Manager
 	if cfg.MCP.Enabled && len(cfg.MCP.Servers) > 0 {
@@ -155,12 +173,12 @@ func main() {
 	// 注册内置命令
 	builtinCmds.RegisterBuiltinCommands(cmdRegistry, chatManager, nil, cfg)
 
-	// 启动 Bubble Tea TUI（主线程）- 使用增强型模型
-	tuiModel := tui.NewEnhancedModel(logChan, statsChan, cfg, chatManager, cmdRegistry)
+	// 启动 Bubble Tea TUI（主线程）- 使用增强型模型，传入 p 以支持聊天界面本地测试 LLM + Skill
+	tuiModel := tui.NewEnhancedModel(logChan, statsChan, cfg, chatManager, cmdRegistry, p)
+	// 不使用 WithMouseAllMotion，以便在日志模式下可用鼠标选择文本并复制
 	program := tea.NewProgram(
 		tuiModel,
 		tea.WithAltScreen(),
-		tea.WithMouseCellMotion(),
 	)
 
 	// 信号处理
