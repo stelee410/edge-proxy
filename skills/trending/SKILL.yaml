@@ -1,0 +1,13 @@
+name: trending
+description: "获取 GitHub 热门仓库信息"
+description_for_llm: "Get trending repositories from GitHub. Use this when user asks about trending topics, popular repositories, or what's hot in technology."
+stage: mid_conversation
+type: code
+input_schema:
+  type: object
+  properties:
+    language:
+      type: string
+      description: "编程语言过滤，如 'go', 'python', 'javascript', 'rust' 等"
+handler: trending_github
+config: {}

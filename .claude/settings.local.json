@@ -1,0 +1,34 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(find:*)",
+      "Bash(wc:*)",
+      "Bash(cat:*)",
+      "Bash(cd:*)",
+      "Bash(go get:*)",
+      "Bash(go mod tidy:*)",
+      "Bash(go build:*)",
+      "Bash(dir:*)",
+      "WebSearch",
+      "Bash(go clean:*)",
+      "Bash(go test:*)",
+      "Bash(ls:*)",
+      "Bash(findstr:*)",
+      "Bash(go doc:*)",
+      "Bash(/tmp/test_template2.go:*)",
+      "Bash(go run:*)",
+      "Bash(curl:*)",
+      "Bash(/tmp/test_trending.go:*)",
+      "Bash(pkill:*)",
+      "Bash(kill:*)",
+      "Bash(timeout:*)",
+      "Bash(/tmp/test_yaml_load.go << 'EOF':*)",
+      "Bash(/tmp/test_yaml_multiline.go:*)",
+      "Bash(/tmp/test_full_flow.go:*)",
+      "Bash(/tmp/test_tea_mouse.go:*)",
+      "WebFetch(domain:github.com)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}

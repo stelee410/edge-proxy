@@ -1,0 +1,19 @@
+name: voice-tts
+type: code
+description: "检测 <tts> 标签，将文字转为语音并返回音频数据"
+stage: post_conversation
+handler: "tts"
+
+# TTS handler 配置
+# provider 支持: "openai", "minimax"
+# minimax 使用 MiniMax T2A v2 API: https://platform.minimaxi.com/docs/api-reference/speech-t2a-http
+config:
+  provider: "minimax"
+  model: "speech-2.8-hd"
+  voice: "male-qn-qingse"
+  format: "mp3"
+  api_key: ""        # MiniMax API Key（必填）
+  speed: 1.0         # 语速 [0.5, 2]
+  vol: 1.0           # 音量 (0, 10]
+  pitch: 0           # 语调 [-12, 12]
+  # emotion: ""      # 可选：happy, sad, angry, fearful, disgusted, surprised, calm, fluent

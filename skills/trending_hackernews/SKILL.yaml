@@ -1,0 +1,10 @@
+name: trending_hackernews
+description: "获取 Hacker News 热门讨论"
+description_for_llm: "Get trending discussions from Hacker News. Use this when user asks about trending tech news, popular discussions, or what's being talked about in tech community."
+stage: mid_conversation
+type: code
+input_schema:
+  type: object
+  properties: {}
+handler: trending_hackernews
+config: {}
