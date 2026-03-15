@@ -48,7 +48,23 @@ func (p *FallbackProvider) Complete(ctx context.Context, req *CompletionRequest)
 	return nil, primaryErr
 }
 
-// StreamComplete 流式补全（暂未实现）
+// StreamComplete 流式补全 - 先尝试主 Provider，失败后依次尝试 fallback
 func (p *FallbackProvider) StreamComplete(ctx context.Context, req *CompletionRequest) (<-chan StreamEvent, error) {
-	return nil, fmt.Errorf("StreamComplete not implemented for fallback provider")
+	ch, err := p.primary.StreamComplete(ctx, req)
+	if err == nil {
+		return ch, nil
+	}
+
+	primaryErr := err
+	for _, fb := range p.fallbacks {
+		ch, err = fb.StreamComplete(ctx, req)
+		if err == nil {
+			return ch, nil
+		}
+	}
+
+	if len(p.fallbacks) > 0 {
+		return nil, fmt.Errorf("all providers StreamComplete failed, primary (%s): %w", p.primary.Name(), primaryErr)
+	}
+	return nil, primaryErr
 }

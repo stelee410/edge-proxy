@@ -71,9 +71,14 @@ type ToolResult struct {
 
 // StreamEvent 流式响应事件
 type StreamEvent struct {
-	Content string // 增量文本内容
-	Done    bool   // 是否结束
-	Error   error  // 错误信息
+	Content      string     // 增量文本内容
+	Done         bool       // 是否结束
+	Error        error      // 错误信息
+	Model        string     // 实际使用的模型名（Done=true 时携带）
+	InputTokens  int        // 输入 token 数（Done=true 时携带）
+	OutputTokens int        // 输出 token 数（Done=true 时携带）
+	ToolCalls    []ToolCall // LLM 请求调用的工具（Done=true 时携带）
+	StopReason   string     // 停止原因（Done=true 时携带）
 }
 
 // Provider LLM 提供商接口

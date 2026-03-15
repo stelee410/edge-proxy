@@ -100,13 +100,19 @@ func (c *Client) call(ctx context.Context, method string, params interface{}) (*
 		return nil, fmt.Errorf("failed to send request: %w", err)
 	}
 
-	// 等待响应
+	// 等待响应（使用 context deadline；若无 deadline，兜底 5 分钟，适配 Suno 等耗时工具）
+	timeout := 5 * time.Minute
+	if deadline, ok := ctx.Deadline(); ok {
+		if remaining := time.Until(deadline); remaining > 0 && remaining < timeout {
+			timeout = remaining
+		}
+	}
 	select {
 	case resp := <-ch:
 		return resp, nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
-	case <-time.After(30 * time.Second):
+	case <-time.After(timeout):
 		return nil, fmt.Errorf("request timeout for method %q", method)
 	}
 }

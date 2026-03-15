@@ -16,6 +16,7 @@ import {
 } from '@modelcontextprotocol/sdk/types.js';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import fs from 'fs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -155,18 +156,7 @@ async function handleLogin() {
 
     console.error('[Suno] 正在启动浏览器...');
 
-    context = await chromium.launchPersistentContext(USER_DATA_DIR, {
-      headless: false,
-      viewport: null,
-      args: [
-        '--start-maximized',
-        '--disable-blink-features=AutomationControlled',
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-      ],
-      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-      ignoreDefaultArgs: ['--enable-automation'],
-    });
+    context = await launchContext(false); // 登录时始终有头模式，让用户看到浏览器
 
     // 使用已有页面或创建新页面
     const pages = context.pages();
@@ -237,20 +227,29 @@ async function handleLogin() {
  */
 async function handleGenerate(args) {
   try {
-    if (!context || !page) {
-      return {
-        content: [{
-          type: 'text',
-          text: JSON.stringify({
-            success: false,
-            error: '请先调用 suno_login 打开浏览器',
-          }, null, 2),
-        }],
-        isError: true,
-      };
-    }
-
     const prompt = args.prompt || '';
+
+    // 若无浏览器会话，自动启动
+    // 有持久化登录数据 → 无头模式（静默后台运行）
+    // 没有登录数据 → 有头模式（让用户看到浏览器完成登录）
+    if (!context || !page) {
+      const loginData = hasLoginData();
+      const headless = loginData;
+      console.error(`[Suno] 无浏览器会话，自动启动（headless=${headless}，loginData=${loginData}）...`);
+      try {
+        context = await launchContext(headless);
+        const pages = context.pages();
+        page = pages.length > 0 ? pages[0] : await context.newPage();
+        await page.goto('https://suno.ai', { waitUntil: 'networkidle', timeout: 30000 });
+        await page.waitForTimeout(2000);
+      } catch (e) {
+        console.error('[Suno] 自动启动浏览器失败:', e.message);
+        return {
+          content: [{ type: 'text', text: '[NOTIFY]Suno 浏览器启动失败，请稍后再试' }],
+          isError: true,
+        };
+      }
+    }
 
     console.error(`[Suno] 正在处理: 打开创建页并填写提示词 "${prompt}"`);
 
@@ -259,10 +258,7 @@ async function handleGenerate(args) {
       return {
         content: [{
           type: 'text',
-          text: JSON.stringify({
-            success: false,
-            error: '未登录或登录已过期，请先调用 suno_login 重新登录',
-          }, null, 2),
+          text: '[NOTIFY]Suno 未登录，请在浏览器中完成登录后再试',
         }],
         isError: true,
       };
@@ -1027,6 +1023,38 @@ async function switchToCustomMode() {
       console.error(`[Suno] Custom Mode ${selector}:`, e.message);
     }
   }
+}
+
+/**
+ * 判断是否已有持久化登录数据（.chrome-data 目录非空）
+ */
+function hasLoginData() {
+  try {
+    if (!fs.existsSync(USER_DATA_DIR)) return false;
+    const entries = fs.readdirSync(USER_DATA_DIR);
+    return entries.length > 0;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * 启动浏览器上下文
+ * @param {boolean} headless - 是否无头模式
+ */
+async function launchContext(headless = false) {
+  return chromium.launchPersistentContext(USER_DATA_DIR, {
+    headless,
+    viewport: null,
+    args: [
+      '--start-maximized',
+      '--disable-blink-features=AutomationControlled',
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+    ],
+    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+    ignoreDefaultArgs: ['--enable-automation'],
+  });
 }
 
 /**

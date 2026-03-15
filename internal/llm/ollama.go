@@ -1,6 +1,7 @@
 package llm
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -38,9 +39,108 @@ func (p *OllamaProvider) Name() string {
 	return p.name
 }
 
-// StreamComplete 流式补全（暂未实现）
+// StreamComplete 流式补全 - 调用 Ollama /api/chat（stream=true，默认行为）
 func (p *OllamaProvider) StreamComplete(ctx context.Context, req *CompletionRequest) (<-chan StreamEvent, error) {
-	return nil, fmt.Errorf("StreamComplete not implemented for Ollama provider %q", p.name)
+	messages := make([]ollamaMessage, 0, len(req.Messages)+1)
+	if req.SystemPrompt != "" {
+		messages = append(messages, ollamaMessage{Role: "system", Content: req.SystemPrompt})
+	}
+	for _, m := range req.Messages {
+		om := ollamaMessage{Role: m.Role, Content: m.Content}
+		if len(m.ContentParts) > 0 {
+			var textParts []string
+			for _, cp := range m.ContentParts {
+				if cp.Type == "text" {
+					textParts = append(textParts, cp.Text)
+				} else if cp.Type == "image" && cp.ImageBase64 != "" {
+					om.Images = append(om.Images, cp.ImageBase64)
+				}
+			}
+			if len(textParts) > 0 {
+				om.Content = textParts[0]
+				for _, t := range textParts[1:] {
+					om.Content += "\n" + t
+				}
+			}
+			if om.Content == "" && len(om.Images) > 0 {
+				om.Content = "请分析以上图片"
+			}
+		}
+		messages = append(messages, om)
+	}
+
+	model := req.Model
+	if model == "" {
+		model = p.model
+	}
+	ollamaReq := ollamaRequest{Model: model, Messages: messages, Stream: true}
+	if req.Temperature > 0 || req.MaxTokens > 0 {
+		ollamaReq.Options = &ollamaOptions{Temperature: req.Temperature, NumPredict: req.MaxTokens}
+	}
+
+	body, err := json.Marshal(ollamaReq)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	url := p.baseURL + "/api/chat"
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+
+	streamClient := &http.Client{Timeout: 0}
+	resp, err := streamClient.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("request failed: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		return nil, fmt.Errorf("Ollama returned status %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	ch := make(chan StreamEvent, 16)
+	go func() {
+		defer resp.Body.Close()
+		defer close(ch)
+
+		scanner := bufio.NewScanner(resp.Body)
+		for scanner.Scan() {
+			select {
+			case <-ctx.Done():
+				ch <- StreamEvent{Error: ctx.Err(), Done: true}
+				return
+			default:
+			}
+			var chunk ollamaResponse
+			if err := json.Unmarshal(scanner.Bytes(), &chunk); err != nil {
+				continue
+			}
+			if chunk.Error != "" {
+				ch <- StreamEvent{Error: fmt.Errorf("Ollama error: %s", chunk.Error), Done: true}
+				return
+			}
+			if chunk.Message.Content != "" {
+				ch <- StreamEvent{Content: chunk.Message.Content}
+			}
+			if chunk.Done {
+				ch <- StreamEvent{
+					Done:         true,
+					Model:        chunk.Model,
+					InputTokens:  chunk.PromptEvalCount,
+					OutputTokens: chunk.EvalCount,
+				}
+				return
+			}
+		}
+		if err := scanner.Err(); err != nil {
+			ch <- StreamEvent{Error: fmt.Errorf("stream read error: %w", err), Done: true}
+		}
+	}()
+
+	return ch, nil
 }
 
 type ollamaRequest struct {

@@ -46,21 +46,34 @@ type EdgeAttachment struct {
 
 // EdgeRequest 服务器发来的请求（与服务端 models.EdgeRequest 对应）
 type EdgeRequest struct {
-	RequestID    string            `json:"request_id"`
-	AgentUUID    string            `json:"agent_uuid"`
-	SessionUUID  string            `json:"session_uuid"`
-	Type         string            `json:"type"` // "chat" | "simulate"
-	SystemPrompt string            `json:"system_prompt"`
-	Messages     []EdgeMessage     `json:"messages"`
-	Attachments  json.RawMessage   `json:"attachments,omitempty"` // 当前用户消息的图片附件（image_upload）
-	Model         string          `json:"model"`
-	Temperature   float64         `json:"temperature"`
-	MaxTokens     int             `json:"max_tokens"`
-	MemoryEnabled bool            `json:"memory_enabled"` // 是否启用长期记忆（具体实现由 Edge 自行决定）
-	LLMProvider   string          `json:"llm_provider"`   // Cloud Agent 指定的 LLM provider（优先使用）
-	CreatorID     string          `json:"creator_id"`
-	UserID        string          `json:"user_id,omitempty"` // 用户 ID，用于 memory 按用户隔离（跨会话）
-	Timestamp     time.Time       `json:"timestamp"`
+	RequestID    string          `json:"request_id"`
+	AgentUUID    string          `json:"agent_uuid"`
+	SessionUUID  string          `json:"session_uuid"`
+	Type         string          `json:"type"` // "chat" | "simulate"
+	SystemPrompt string          `json:"system_prompt"`
+	Messages     []EdgeMessage   `json:"messages"`
+	Attachments  json.RawMessage `json:"attachments,omitempty"` // 当前用户消息的图片附件（image_upload）
+	Model        string          `json:"model"`
+	Temperature  float64         `json:"temperature"`
+	MaxTokens    int             `json:"max_tokens"`
+	MemoryEnabled bool           `json:"memory_enabled"` // 是否启用长期记忆（具体实现由 Edge 自行决定）
+	LLMProvider  string          `json:"llm_provider"`   // Cloud Agent 指定的 LLM provider（优先使用）
+	CreatorID    string          `json:"creator_id"`
+	UserID       string          `json:"user_id,omitempty"` // 用户 ID，用于 memory 按用户隔离（跨会话）
+	Stream       bool            `json:"stream,omitempty"`  // 是否使用流式响应
+	Timestamp    time.Time       `json:"timestamp"`
+}
+
+// EdgeStreamChunk 流式响应数据块（NDJSON 格式发送到服务器）
+type EdgeStreamChunk struct {
+	RequestID string          `json:"request_id"`
+	AgentUUID string          `json:"agent_uuid"`
+	Type      string          `json:"type"`               // "delta" | "done" | "error"
+	Content   string          `json:"content,omitempty"`  // delta 文本增量
+	Model     string          `json:"model,omitempty"`    // done 时携带实际模型名
+	Usage     *EdgeTokenUsage `json:"usage,omitempty"`    // done 时携带 token 用量
+	Metadata  map[string]any  `json:"metadata,omitempty"` // done 时携带 metadata
+	Error     string          `json:"error,omitempty"`    // error 时的错误信息
 }
 
 // EdgeMessage 消息格式
@@ -420,9 +433,13 @@ func (p *Proxy) pollAndProcess(ctx context.Context) error {
 		return fmt.Errorf("failed to parse edge request: %w", err)
 	}
 
-	logger.Info("Received request: id=%s type=%s messages=%d", edgeReq.RequestID, edgeReq.Type, len(edgeReq.Messages))
+	logger.Info("Received request: id=%s type=%s messages=%d stream=%v", edgeReq.RequestID, edgeReq.Type, len(edgeReq.Messages), edgeReq.Stream)
 	p.requestCount++
-	go p.handleRequest(ctx, &edgeReq, nil)
+	if edgeReq.Stream {
+		go p.handleRequestStream(ctx, &edgeReq)
+	} else {
+		go p.handleRequest(ctx, &edgeReq, nil)
+	}
 	return nil
 }
 
@@ -687,7 +704,25 @@ func (p *Proxy) handleRequest(ctx context.Context, req *EdgeRequest, sink respon
 		logger.Info("Request %s: LLM requested %d tool calls (round %d): %v",
 			req.RequestID, len(llmResp.ToolCalls), round, toolCallNames(llmResp.ToolCalls))
 
+		for _, tc := range llmResp.ToolCalls {
+			p.notifyUser(req, "status", fmt.Sprintf("正在调用 %s...", tc.Name),
+				map[string]any{"stage": "tool_call", "tool_name": tc.Name})
+		}
 		toolResults := p.toolExecutor.Execute(toolCtx, llmResp.ToolCalls)
+
+		// 检查 [NOTIFY] 前缀：工具要求直接推送通知给用户并终止循环
+		if shouldStop := p.handleToolNotify(req, toolResults); shouldStop {
+			edgeResp.Success = true
+			edgeResp.Content = ""
+			submit(ctx, edgeResp)
+			success = true
+			return
+		}
+
+		for _, tc := range llmResp.ToolCalls {
+			p.notifyUser(req, "status", fmt.Sprintf("%s 执行完成", tc.Name),
+				map[string]any{"stage": "tool_done", "tool_name": tc.Name})
+		}
 
 		// 将 assistant 消息（含 tool_calls）追加到对话历史
 		// OpenAI 要求 tool 消息前必须有包含 tool_calls 的 assistant 消息
@@ -779,6 +814,345 @@ func (p *Proxy) handleRequest(ctx context.Context, req *EdgeRequest, sink respon
 		logger.Info("Request %s completed: provider=%s model=%s tokens=%d elapsed=%s",
 			req.RequestID, provider.Name(), finalModel, totalTokens, elapsed)
 	}
+}
+
+// streamResponse 通过长连接 POST 流式推送响应块到服务器（NDJSON 长连接）
+// 返回 writer 函数和 closer 函数，调用者通过 writer 发送 chunk，结束后调用 closer 关闭连接
+func (p *Proxy) streamResponse(ctx context.Context) (writer func(chunk *EdgeStreamChunk) error, closer func() error, err error) {
+	pr, pw := io.Pipe()
+
+	url := p.config.ServerURL + "/api/v1/edge/stream-respond"
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", url, pr)
+	if err != nil {
+		pw.Close()
+		return nil, nil, fmt.Errorf("failed to create stream request: %w", err)
+	}
+	httpReq.Header.Set("X-Edge-Token", p.config.EdgeToken)
+	httpReq.Header.Set("Content-Type", "application/x-ndjson")
+	httpReq.Header.Set("Transfer-Encoding", "chunked")
+
+	streamClient := &http.Client{Timeout: 0}
+
+	respCh := make(chan *http.Response, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		resp, err := streamClient.Do(httpReq)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		respCh <- resp
+	}()
+
+	writer = func(chunk *EdgeStreamChunk) error {
+		data, err := json.Marshal(chunk)
+		if err != nil {
+			return err
+		}
+		data = append(data, '\n')
+		_, err = pw.Write(data)
+		return err
+	}
+
+	closer = func() error {
+		pw.Close()
+		select {
+		case resp := <-respCh:
+			resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				return fmt.Errorf("stream-respond returned status %d", resp.StatusCode)
+			}
+			return nil
+		case err := <-errCh:
+			return err
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+
+	return writer, closer, nil
+}
+
+// handleRequestStream 处理流式请求：使用 StreamComplete + NDJSON 长连接推送
+func (p *Proxy) handleRequestStream(ctx context.Context, req *EdgeRequest) {
+	start := time.Now()
+	var success bool
+	defer func() {
+		elapsed := time.Since(start)
+		p.statsCollector.RecordRequest(success, elapsed)
+		p.publishStats()
+	}()
+
+	providerName := req.LLMProvider
+	if providerName == "" {
+		providerName = req.Model
+	}
+	provider, err := p.selectProvider(providerName)
+	if err != nil {
+		logger.Error("Request %s: no LLM provider available: %v", req.RequestID, err)
+		p.submitResponse(ctx, &EdgeResponse{
+			RequestID: req.RequestID, AgentUUID: req.AgentUUID,
+			Success: false, Error: fmt.Sprintf("no LLM provider available: %v", err),
+			Timestamp: time.Now(),
+		})
+		p.errorCount++
+		return
+	}
+
+	writer, closer, err := p.streamResponse(ctx)
+	if err != nil {
+		logger.Error("Request %s: failed to open stream connection: %v", req.RequestID, err)
+		p.submitResponse(ctx, &EdgeResponse{
+			RequestID: req.RequestID, AgentUUID: req.AgentUUID,
+			Success: false, Error: fmt.Sprintf("stream connection failed: %v", err),
+			Timestamp: time.Now(),
+		})
+		p.errorCount++
+		return
+	}
+	defer closer()
+
+	sendError := func(errMsg string) {
+		writer(&EdgeStreamChunk{
+			RequestID: req.RequestID, AgentUUID: req.AgentUUID,
+			Type: "error", Error: errMsg,
+		})
+	}
+
+	// === Pre-conversation Skills ===
+	var preResult *skills.PreResult
+	if p.skillPipeline != nil {
+		preInput := &skills.SkillInput{UserMessage: lastUserMessage(req.Messages)}
+		preResult, err = p.skillPipeline.ExecutePreConversation(ctx, preInput)
+		if err != nil {
+			logger.Warn("Request %s: pre-conversation skills error: %v (continuing)", req.RequestID, err)
+		}
+	}
+
+	messages, err := p.buildLLMMessages(ctx, req)
+	if err != nil {
+		logger.Error("Request %s: build messages failed: %v", req.RequestID, err)
+		sendError(fmt.Sprintf("failed to process attachments: %v", err))
+		p.errorCount++
+		return
+	}
+
+	systemPrompt := req.SystemPrompt
+	if p.rulesEngine != nil {
+		systemPrompt = p.rulesEngine.InjectIntoSystemPrompt(systemPrompt)
+	}
+	if preResult != nil && preResult.ExtraSystemPrompt != "" {
+		if systemPrompt != "" {
+			systemPrompt += "\n\n"
+		}
+		systemPrompt += preResult.ExtraSystemPrompt
+	}
+	if p.resourceMgr != nil {
+		systemPrompt = p.resourceMgr.InjectIntoSystemPrompt(ctx, systemPrompt)
+	}
+	if req.MemoryEnabled && req.UserID != "" {
+		memoryFragment := p.fetchMemoryFragment(ctx, req.AgentUUID, req.UserID)
+		if memoryFragment != "" {
+			if systemPrompt != "" {
+				systemPrompt += "\n\n"
+			}
+			systemPrompt += memoryFragment
+		}
+	}
+
+	llmReq := &llm.CompletionRequest{
+		Messages:     messages,
+		Temperature:  req.Temperature,
+		MaxTokens:    req.MaxTokens,
+		SystemPrompt: systemPrompt,
+	}
+	if p.toolExecutor != nil {
+		llmReq.Tools = p.toolExecutor.GetToolDefinitions(req.MemoryEnabled)
+		logger.Info("Request %s: %d tools passed to LLM", req.RequestID, len(llmReq.Tools))
+	}
+
+	var memoryActions []MemoryAction
+	toolCtx := context.WithValue(ctx, edgeReqInfoKey{}, &EdgeReqInfo{UserID: req.UserID, AgentUUID: req.AgentUUID})
+	toolCtx = context.WithValue(toolCtx, memoryActionsKey{}, &memoryActions)
+
+	var totalInputTokens, totalOutputTokens, totalTokens int
+	var finalContent string
+	var finalModel string
+
+	for round := 0; round <= maxToolCallingRounds; round++ {
+		logger.Debug("Request %s: calling LLM provider=%s (round %d, stream)...", req.RequestID, provider.Name(), round)
+
+		streamCh, streamErr := provider.StreamComplete(ctx, llmReq)
+		if streamErr != nil {
+			logger.Error("Request %s: LLM StreamComplete failed (provider=%s, round=%d): %v",
+				req.RequestID, provider.Name(), round, streamErr)
+			sendError(fmt.Sprintf("LLM error: %v", streamErr))
+			p.errorCount++
+			return
+		}
+
+		var roundContent strings.Builder
+		var roundToolCalls []llm.ToolCall
+		var roundModel string
+
+		for event := range streamCh {
+			if event.Error != nil {
+				logger.Error("Request %s: stream error (round=%d): %v", req.RequestID, round, event.Error)
+				sendError(fmt.Sprintf("LLM stream error: %v", event.Error))
+				p.errorCount++
+				return
+			}
+			if event.Content != "" {
+				roundContent.WriteString(event.Content)
+				writer(&EdgeStreamChunk{
+					RequestID: req.RequestID, AgentUUID: req.AgentUUID,
+					Type: "delta", Content: event.Content,
+				})
+			}
+			if event.Done {
+				totalInputTokens += event.InputTokens
+				totalOutputTokens += event.OutputTokens
+				totalTokens += event.InputTokens + event.OutputTokens
+				roundModel = event.Model
+				roundToolCalls = event.ToolCalls
+			}
+		}
+
+		if roundModel != "" {
+			finalModel = roundModel
+		}
+
+		if len(roundToolCalls) == 0 || p.toolExecutor == nil {
+			finalContent = roundContent.String()
+			if round > 0 {
+				logger.Info("Request %s: LLM stream completed with %d rounds", req.RequestID, round+1)
+			}
+			break
+		}
+
+		toolNames := toolCallNames(roundToolCalls)
+		logger.Info("Request %s: LLM requested %d tool calls (round %d, stream): %v",
+			req.RequestID, len(roundToolCalls), round, toolNames)
+
+		for _, name := range toolNames {
+			p.notifyUser(req, "status", fmt.Sprintf("正在调用 %s...", name),
+				map[string]any{"tool_name": name, "stage": "tool_call"})
+		}
+
+		toolResults := p.toolExecutor.Execute(toolCtx, roundToolCalls)
+
+		// 检查 [NOTIFY] 前缀：工具要求直接推送通知给用户并终止循环
+		if shouldStop := p.handleToolNotify(req, toolResults); shouldStop {
+			writer(&EdgeStreamChunk{
+				RequestID: req.RequestID, AgentUUID: req.AgentUUID,
+				Type: "done", Model: finalModel,
+				Usage: &EdgeTokenUsage{
+					InputTokens:  totalInputTokens,
+					OutputTokens: totalOutputTokens,
+					TotalTokens:  totalTokens,
+				},
+			})
+			success = true
+			return
+		}
+
+		for _, name := range toolNames {
+			p.notifyUser(req, "status", fmt.Sprintf("%s 执行完成", name),
+				map[string]any{"tool_name": name, "stage": "tool_done"})
+		}
+
+		llmReq.Messages = append(llmReq.Messages, llm.Message{
+			Role: "assistant", Content: roundContent.String(), ToolCalls: roundToolCalls,
+		})
+		llmReq.ToolResults = toolResults
+
+		if round == maxToolCallingRounds {
+			logger.Warn("Request %s: tool calling exceeded max rounds (%d)", req.RequestID, maxToolCallingRounds)
+			sendError(fmt.Sprintf("tool calling exceeded max rounds (%d)", maxToolCallingRounds))
+			p.errorCount++
+			return
+		}
+	}
+
+	// === Post-conversation Skills ===
+	if p.skillPipeline != nil {
+		var extraCtx map[string]interface{}
+		if preResult != nil {
+			extraCtx = preResult.ExtraContext
+		}
+		postResult, err := p.skillPipeline.ExecutePostConversation(ctx, finalContent, extraCtx)
+		if err != nil {
+			logger.Warn("Request %s: post-conversation skills error: %v (using original content)", req.RequestID, err)
+		} else {
+			finalContent = postResult.Content
+		}
+	}
+
+	// 发送 done 事件
+	doneChunk := &EdgeStreamChunk{
+		RequestID: req.RequestID, AgentUUID: req.AgentUUID,
+		Type:  "done",
+		Model: finalModel,
+		Usage: &EdgeTokenUsage{
+			InputTokens:  totalInputTokens,
+			OutputTokens: totalOutputTokens,
+			TotalTokens:  totalTokens,
+		},
+	}
+	if len(memoryActions) > 0 {
+		doneChunk.Metadata = map[string]any{"memory_actions": memoryActions}
+	}
+	writer(doneChunk)
+
+	success = true
+	elapsed := time.Since(start)
+	logger.Info("Request %s stream completed: provider=%s model=%s tokens=%d elapsed=%s",
+		req.RequestID, provider.Name(), finalModel, totalTokens, elapsed)
+}
+
+// handleToolNotify 扫描工具执行结果中的 [NOTIFY] 前缀。
+// 若发现任意结果以 [NOTIFY] 开头，则立即将其内容推送给用户，并返回 true 表示应终止 LLM 循环。
+// 同时将结果内容中的前缀剥离，避免将原始标记暴露给 LLM。
+func (p *Proxy) handleToolNotify(req *EdgeRequest, results []llm.ToolResult) (shouldStop bool) {
+	const prefix = "[NOTIFY]"
+	for i, r := range results {
+		if strings.HasPrefix(r.Content, prefix) {
+			msg := strings.TrimPrefix(r.Content, prefix)
+			p.notifyUser(req, "status", msg, nil)
+			results[i].Content = msg
+			shouldStop = true
+		}
+	}
+	return
+}
+
+// notifyUser 向用户推送 Edge 状态通知（异步、失败静默忽略，不影响主流程）
+func (p *Proxy) notifyUser(req *EdgeRequest, notifyType, content string, meta map[string]any) {
+	if req.SessionUUID == "" {
+		return
+	}
+	go func() {
+		payload := map[string]any{
+			"agent_uuid":   req.AgentUUID,
+			"session_uuid": req.SessionUUID,
+			"type":         notifyType,
+			"content":      content,
+		}
+		if len(meta) > 0 {
+			payload["metadata"] = meta
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		resp, err := p.doRequest(ctx, "POST", "/api/v1/edge/notify", payload)
+		if err != nil {
+			logger.Warn("notifyUser: request failed: %v", err)
+			return
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			logger.Warn("notifyUser: server returned status %d", resp.StatusCode)
+		}
+	}()
 }
 
 // lastUserMessage 获取最后一条用户消息的内容

@@ -1,12 +1,14 @@
 package llm
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -45,9 +47,230 @@ func (p *ClaudeProvider) Name() string {
 	return p.name
 }
 
-// StreamComplete 流式补全（暂未实现）
+// StreamComplete 流式补全 - 调用 Anthropic Messages API（stream=true）
 func (p *ClaudeProvider) StreamComplete(ctx context.Context, req *CompletionRequest) (<-chan StreamEvent, error) {
-	return nil, fmt.Errorf("StreamComplete not implemented for Claude provider %q", p.name)
+	messages := make([]claudeMessage, 0, len(req.Messages)+len(req.ToolResults))
+	for _, m := range req.Messages {
+		if m.Role == "system" {
+			continue
+		}
+		if m.Role == "assistant" && len(m.ToolCalls) > 0 {
+			blocks := make([]claudeContentBlock, 0, len(m.ToolCalls)+1)
+			if m.Content != "" {
+				blocks = append(blocks, claudeContentBlock{Type: "text", Text: m.Content})
+			}
+			for _, tc := range m.ToolCalls {
+				blocks = append(blocks, claudeContentBlock{Type: "tool_use", ID: tc.ID, Name: tc.Name, Input: tc.Arguments})
+			}
+			messages = append(messages, claudeMessage{Role: "assistant", Content: blocks})
+		} else if len(m.ContentParts) > 0 {
+			contentBlocks := make([]interface{}, 0, len(m.ContentParts))
+			var lastText string
+			for _, cp := range m.ContentParts {
+				if cp.Type == "text" {
+					lastText = cp.Text
+				} else if cp.Type == "image" && cp.ImageBase64 != "" {
+					mime := cp.MimeType
+					if mime == "" {
+						mime = "image/jpeg"
+					}
+					contentBlocks = append(contentBlocks, map[string]interface{}{
+						"type": "image",
+						"source": map[string]string{"type": "base64", "media_type": mime, "data": cp.ImageBase64},
+					})
+				}
+			}
+			if lastText != "" {
+				contentBlocks = append(contentBlocks, map[string]interface{}{"type": "text", "text": lastText})
+			}
+			if len(contentBlocks) > 0 {
+				messages = append(messages, claudeMessage{Role: m.Role, Content: contentBlocks})
+			} else {
+				messages = append(messages, claudeMessage{Role: m.Role, Content: m.Content})
+			}
+		} else {
+			messages = append(messages, claudeMessage{Role: m.Role, Content: m.Content})
+		}
+	}
+	if len(req.ToolResults) > 0 {
+		blocks := make([]claudeContentBlock, 0, len(req.ToolResults))
+		for _, tr := range req.ToolResults {
+			blocks = append(blocks, claudeContentBlock{Type: "tool_result", ToolUseID: tr.ToolCallID, Content: tr.Content, IsError: tr.IsError})
+		}
+		messages = append(messages, claudeMessage{Role: "user", Content: blocks})
+	}
+
+	model := req.Model
+	if model == "" {
+		model = p.model
+	}
+	maxTokens := req.MaxTokens
+	if maxTokens == 0 {
+		maxTokens = 4096
+	}
+
+	claudeReq := claudeRequest{Model: model, MaxTokens: maxTokens, System: req.SystemPrompt, Messages: messages}
+	if req.Temperature > 0 {
+		claudeReq.Temperature = &req.Temperature
+	}
+	if len(req.Tools) > 0 {
+		claudeReq.Tools = make([]claudeTool, 0, len(req.Tools))
+		for _, t := range req.Tools {
+			claudeReq.Tools = append(claudeReq.Tools, claudeTool{Name: t.Name, Description: t.Description, InputSchema: t.InputSchema})
+		}
+	}
+
+	body, err := json.Marshal(struct {
+		claudeRequest
+		Stream bool `json:"stream"`
+	}{claudeReq, true})
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	url := p.baseURL + "/v1/messages"
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("x-api-key", p.apiKey)
+	httpReq.Header.Set("anthropic-version", claudeAPIVersion)
+
+	streamClient := &http.Client{Timeout: 0}
+	resp, err := streamClient.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("request failed: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		return nil, fmt.Errorf("Anthropic API returned status %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	ch := make(chan StreamEvent, 16)
+	go func() {
+		defer resp.Body.Close()
+		defer close(ch)
+
+		scanner := bufio.NewScanner(resp.Body)
+		var inputTokens, outputTokens int
+		var respModel string
+
+		type partialToolUse struct {
+			id    string
+			name  string
+			input strings.Builder
+		}
+		toolUseMap := map[int]*partialToolUse{}
+
+		for scanner.Scan() {
+			select {
+			case <-ctx.Done():
+				ch <- StreamEvent{Error: ctx.Err(), Done: true}
+				return
+			default:
+			}
+			line := strings.TrimSpace(scanner.Text())
+			if line == "" || !strings.HasPrefix(line, "data: ") {
+				continue
+			}
+			data := strings.TrimPrefix(line, "data: ")
+
+			var evt struct {
+				Type         string `json:"type"`
+				Index        int    `json:"index"`
+				ContentBlock *struct {
+					Type string `json:"type"`
+					ID   string `json:"id"`
+					Name string `json:"name"`
+				} `json:"content_block,omitempty"`
+				Delta *struct {
+					Type        string `json:"type"`
+					Text        string `json:"text,omitempty"`
+					PartialJSON string `json:"partial_json,omitempty"`
+				} `json:"delta,omitempty"`
+				Usage *struct {
+					InputTokens  int `json:"input_tokens"`
+					OutputTokens int `json:"output_tokens"`
+				} `json:"usage,omitempty"`
+				Message *struct {
+					Model string `json:"model,omitempty"`
+					Usage *struct {
+						InputTokens  int `json:"input_tokens"`
+						OutputTokens int `json:"output_tokens"`
+					} `json:"usage,omitempty"`
+				} `json:"message,omitempty"`
+			}
+			if err := json.Unmarshal([]byte(data), &evt); err != nil {
+				continue
+			}
+
+			if evt.Message != nil {
+				if evt.Message.Model != "" {
+					respModel = evt.Message.Model
+				}
+				if evt.Message.Usage != nil {
+					inputTokens = evt.Message.Usage.InputTokens
+					outputTokens = evt.Message.Usage.OutputTokens
+				}
+			}
+			if evt.Usage != nil {
+				if evt.Usage.InputTokens > 0 {
+					inputTokens = evt.Usage.InputTokens
+				}
+				if evt.Usage.OutputTokens > 0 {
+					outputTokens = evt.Usage.OutputTokens
+				}
+			}
+
+			switch evt.Type {
+			case "content_block_start":
+				if evt.ContentBlock != nil && evt.ContentBlock.Type == "tool_use" {
+					toolUseMap[evt.Index] = &partialToolUse{id: evt.ContentBlock.ID, name: evt.ContentBlock.Name}
+				}
+			case "content_block_delta":
+				if evt.Delta != nil {
+					if evt.Delta.Type == "text_delta" && evt.Delta.Text != "" {
+						ch <- StreamEvent{Content: evt.Delta.Text}
+					}
+					if evt.Delta.Type == "input_json_delta" && evt.Delta.PartialJSON != "" {
+						if tu, ok := toolUseMap[evt.Index]; ok {
+							tu.input.WriteString(evt.Delta.PartialJSON)
+						}
+					}
+				}
+			case "message_delta", "message_stop":
+				var toolCalls []ToolCall
+				for i := 0; ; i++ {
+					tu, ok := toolUseMap[i]
+					if !ok {
+						break
+					}
+					inputStr := tu.input.String()
+					if inputStr == "" {
+						inputStr = "{}"
+					}
+					var args map[string]interface{}
+					json.Unmarshal([]byte(inputStr), &args)
+					toolCalls = append(toolCalls, ToolCall{ID: tu.id, Name: tu.name, Arguments: args})
+				}
+				ch <- StreamEvent{
+					Done:         true,
+					Model:        respModel,
+					InputTokens:  inputTokens,
+					OutputTokens: outputTokens,
+					ToolCalls:    toolCalls,
+				}
+				return
+			}
+		}
+		if err := scanner.Err(); err != nil {
+			ch <- StreamEvent{Error: fmt.Errorf("stream read error: %w", err), Done: true}
+		}
+	}()
+
+	return ch, nil
 }
 
 // Anthropic Messages API 请求/响应结构
