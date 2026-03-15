@@ -18,6 +18,14 @@ coverage.txt
 
 # 依赖与缓存
 /vendor/
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
 
 # IDE / 编辑器
 .idea/
@@ -38,3 +46,7 @@ logs/
 tmp/
 temp/
 *.tmp
+
+# MCP 服务器缓存与运行时数据
+mcp-servers/**/.chrome-data/
+mcp-servers/**/node_modules/

@@ -26,7 +26,9 @@
       "Bash(/tmp/test_yaml_multiline.go:*)",
       "Bash(/tmp/test_full_flow.go:*)",
       "Bash(/tmp/test_tea_mouse.go:*)",
-      "WebFetch(domain:github.com)"
+      "WebFetch(domain:github.com)",
+      "Bash(npm install:*)",
+      "Bash(node:*)"
     ],
     "deny": [],
     "ask": []
