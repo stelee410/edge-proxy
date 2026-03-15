@@ -47,6 +47,11 @@ tmp/
 temp/
 *.tmp
 
+# 本地数据库
+*.db
+*.db-shm
+*.db-wal
+
 # MCP 服务器缓存与运行时数据
 mcp-servers/**/.chrome-data/
 mcp-servers/**/node_modules/

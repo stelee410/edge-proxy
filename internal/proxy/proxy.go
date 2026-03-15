@@ -84,18 +84,21 @@ type EdgeMessage struct {
 
 // EdgeResponse 返回给服务器的响应
 type EdgeResponse struct {
-	RequestID   string            `json:"request_id"`
-	AgentUUID   string            `json:"agent_uuid"`
-	Success     bool              `json:"success"`
-	Content     string            `json:"content,omitempty"`
-	Model       string            `json:"model,omitempty"`
-	Usage       *EdgeTokenUsage   `json:"usage,omitempty"`
-	Metadata    map[string]any    `json:"metadata,omitempty"` // 供 client 使用，如 memory_actions
-	Error       string            `json:"error,omitempty"`
-	Timestamp   time.Time         `json:"timestamp"`
-	AudioBase64 string            `json:"audio_base64,omitempty"` // TTS 音频数据（Base64 编码，fallback）
-	AudioFormat string            `json:"audio_format,omitempty"` // 音频格式（mp3, wav 等）
-	AudioURL    string            `json:"audio_url,omitempty"`    // 音频下载 URL（替代 base64）
+	RequestID   string          `json:"request_id"`
+	AgentUUID   string          `json:"agent_uuid"`
+	Success     bool            `json:"success"`
+	Content     string          `json:"content,omitempty"`
+	Model       string          `json:"model,omitempty"`
+	Usage       *EdgeTokenUsage `json:"usage,omitempty"`
+	Metadata    map[string]any  `json:"metadata,omitempty"` // 供 client 使用，如 memory_actions
+	Error       string          `json:"error,omitempty"`
+	Timestamp   time.Time       `json:"timestamp"`
+	AudioBase64 string          `json:"audio_base64,omitempty"` // TTS 音频数据（Base64 编码，fallback）
+	AudioFormat string          `json:"audio_format,omitempty"` // 音频格式（mp3, wav 等）
+	AudioURL    string          `json:"audio_url,omitempty"`    // 音频下载 URL（替代 base64）
+	// Queued=true 表示请求已进入本地队列，服务端不应保存消息到 DB，
+	// 最终结果将通过 /edge/notify save_to_db=true 推送。
+	Queued bool `json:"queued,omitempty"`
 }
 
 // MemoryAction 本次对话中的记忆操作，供 client 展示
@@ -126,8 +129,10 @@ type Proxy struct {
 	running         bool
 	requestCount    int
 	errorCount      int
-	statsCollector  *StatsCollector   // 统计收集器
+	statsCollector  *StatsCollector  // 统计收集器
 	statsChan       chan<- ProxyStats // 统计数据通道
+	orderCache      *OrderCache      // 本地订单持久化队列
+	workerPool      *WorkerPool      // 并发 Worker 池
 }
 
 // New 创建 Proxy 实例
@@ -139,7 +144,24 @@ func New(cfg *config.Config, registry *llm.Registry) *Proxy {
 		defaultProvider, _ = registry.Default()
 	}
 
-	return &Proxy{
+	cc := cfg.Concurrency
+	if cc.MaxWorkers <= 0 {
+		cc.MaxWorkers = 2
+	}
+	if cc.MaxQueueSize <= 0 {
+		cc.MaxQueueSize = 10
+	}
+	if cc.DBPath == "" {
+		cc.DBPath = "./orders.db"
+	}
+
+	orderCache, err := NewOrderCache(cc.DBPath, cc.MaxQueueSize)
+	if err != nil {
+		logger.Warn("[Proxy] failed to open order cache (%s), falling back to no persistence: %v", cc.DBPath, err)
+		orderCache = nil
+	}
+
+	p := &Proxy{
 		config:          cfg,
 		llmRegistry:     registry,
 		defaultProvider: defaultProvider,
@@ -147,7 +169,14 @@ func New(cfg *config.Config, registry *llm.Registry) *Proxy {
 			Timeout: cfg.PollTimeout + 10*time.Second,
 		},
 		statsCollector: NewStatsCollector(),
+		orderCache:     orderCache,
 	}
+
+	if orderCache != nil {
+		p.workerPool = NewWorkerPool(cc.MaxWorkers, orderCache, p)
+	}
+
+	return p
 }
 
 // SetRulesEngine 设置 Rules 引擎
@@ -228,11 +257,18 @@ func (p *Proxy) Run(ctx context.Context) error {
 	logger.Info("Edge Token: %s", logger.MaskToken(p.config.EdgeToken))
 	logger.Info("Heartbeat interval: %s, Poll timeout: %s", p.config.HeartbeatInterval, p.config.PollTimeout)
 
+	cc := p.config.Concurrency
+	if p.orderCache != nil {
+		logger.Info("Order cache: max_workers=%d, max_queue=%d, db=%s",
+			cc.MaxWorkers, cc.MaxQueueSize, cc.DBPath)
+	}
+
 	// 连接服务器（带重试）
 	if err := p.connectWithRetry(ctx); err != nil {
 		return fmt.Errorf("failed to connect: %w", err)
 	}
-	defer p.disconnect(ctx)
+	// 优雅退出：先通知用户，再断开连接
+	defer p.gracefulShutdown(ctx)
 
 	// 更新连接状态
 	p.statsCollector.SetConnected(true)
@@ -240,6 +276,12 @@ func (p *Proxy) Run(ctx context.Context) error {
 
 	p.running = true
 	logger.Info("Connected successfully, entering main loop")
+
+	// 启动 Worker 池
+	if p.workerPool != nil {
+		p.workerPool.Start(ctx)
+		p.recoverPendingOrders(ctx)
+	}
 
 	go p.heartbeatLoop(ctx)
 
@@ -259,7 +301,6 @@ func (p *Proxy) Run(ctx context.Context) error {
 			p.running = false
 			return nil
 		case <-statsTicker.C:
-			// 定期推送统计数据
 			p.publishStats()
 		default:
 			if err := p.pollAndProcess(ctx); err != nil {
@@ -271,16 +312,76 @@ func (p *Proxy) Run(ctx context.Context) error {
 					return nil
 				case <-time.After(retryDelay):
 				}
-				// 指数退避
 				retryDelay = retryDelay * 2
 				if retryDelay > maxRetryDelay {
 					retryDelay = maxRetryDelay
 				}
 			} else {
-				retryDelay = 2 * time.Second // 成功后重置
+				retryDelay = 2 * time.Second
 			}
 		}
 	}
+}
+
+// recoverPendingOrders 启动时从 SQLite 恢复上次未完成的订单。
+// - processing 状态（崩溃中断）：通知用户重试，标记 failed。
+// - queued 状态（排队中未执行）：重新派送给 Worker 池继续处理。
+func (p *Proxy) recoverPendingOrders(ctx context.Context) {
+	if p.orderCache == nil {
+		return
+	}
+	orders, err := p.orderCache.LoadPendingOrders()
+	if err != nil {
+		logger.Warn("[Proxy] recover pending orders: %v", err)
+		return
+	}
+	if len(orders) == 0 {
+		return
+	}
+
+	var recovered, aborted int
+	for _, o := range orders {
+		if o.Status == OrderStatusProcessing {
+			// 上次崩溃时正在处理，无法继续，通知用户重试
+			p.orderCache.MarkFailed(o.RequestID)
+			p.notifyUser(o.Request, "status",
+				"抱歉，我刚才意外重启，上次的请求没有完成，请重新发送。", nil)
+			aborted++
+		} else {
+			// queued：重新分发给 Worker
+			p.orderCache.Dispatch(o)
+			recovered++
+		}
+	}
+	logger.Info("[Proxy] recovered %d queued orders, aborted %d crashed orders", recovered, aborted)
+}
+
+// gracefulShutdown 优雅退出：通知所有排队中的用户，等待进行中任务完成，再断开连接。
+func (p *Proxy) gracefulShutdown(ctx context.Context) {
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	if p.orderCache != nil {
+		// 通知所有 queued 订单用户
+		queued, err := p.orderCache.AllQueuedOrders()
+		if err == nil && len(queued) > 0 {
+			logger.Info("[Proxy] notifying %d queued orders of shutdown", len(queued))
+			for _, o := range queued {
+				p.orderCache.MarkFailed(o.RequestID)
+				p.notifyUser(o.Request, "status",
+					"我已暂时下线，您的请求未能处理，请等我上线后重新发送。", nil)
+			}
+		}
+
+		// 等待进行中的 Worker 完成（最多 25 秒）
+		if p.workerPool != nil {
+			p.workerPool.WaitIdle(25 * time.Second)
+		}
+
+		p.orderCache.Close()
+	}
+
+	p.disconnect(shutdownCtx)
 }
 
 // connectWithRetry 带重试的连接
@@ -386,7 +487,7 @@ func (p *Proxy) sendHeartbeat(ctx context.Context) error {
 	return nil
 }
 
-// pollAndProcess 轮询请求并处理
+// pollAndProcess 轮询服务端队列，将请求写入本地 OrderCache 或直接处理。
 func (p *Proxy) pollAndProcess(ctx context.Context) error {
 	url := fmt.Sprintf("/api/v1/edge/poll?agent_uuid=%s&timeout=%d",
 		p.config.AgentUUID, int(p.config.PollTimeout.Seconds()))
@@ -413,7 +514,6 @@ func (p *Proxy) pollAndProcess(ctx context.Context) error {
 		return fmt.Errorf("failed to read poll response: %w", err)
 	}
 
-	// 服务端返回格式为 {"success": true, "data": ...}
 	var envelope struct {
 		Success bool            `json:"success"`
 		Data    json.RawMessage `json:"data"`
@@ -422,9 +522,7 @@ func (p *Proxy) pollAndProcess(ctx context.Context) error {
 		return fmt.Errorf("failed to parse poll envelope: %w", err)
 	}
 
-	// 超时返回 null data
-	if !envelope.Success || len(envelope.Data) == 0 ||
-		string(envelope.Data) == "null" {
+	if !envelope.Success || len(envelope.Data) == 0 || string(envelope.Data) == "null" {
 		return nil
 	}
 
@@ -433,14 +531,119 @@ func (p *Proxy) pollAndProcess(ctx context.Context) error {
 		return fmt.Errorf("failed to parse edge request: %w", err)
 	}
 
-	logger.Info("Received request: id=%s type=%s messages=%d stream=%v", edgeReq.RequestID, edgeReq.Type, len(edgeReq.Messages), edgeReq.Stream)
+	logger.Info("Received request: id=%s type=%s messages=%d stream=%v",
+		edgeReq.RequestID, edgeReq.Type, len(edgeReq.Messages), edgeReq.Stream)
 	p.requestCount++
+
+	// 有本地 Worker 池：走本地队列模式
+	if p.workerPool != nil {
+		p.enqueueOrReject(ctx, &edgeReq)
+		return nil
+	}
+
+	// 无本地 Worker 池（降级）：直接 goroutine 处理（原有行为）
 	if edgeReq.Stream {
 		go p.handleRequestStream(ctx, &edgeReq)
 	} else {
 		go p.handleRequest(ctx, &edgeReq, nil)
 	}
 	return nil
+}
+
+// enqueueOrReject 尝试将请求入本地队列；队列已满则立刻拒绝并通知用户。
+func (p *Proxy) enqueueOrReject(ctx context.Context, edgeReq *EdgeRequest) {
+	if p.orderCache.IsFull() {
+		// 队列已满：拒绝，立刻给用户发 SSE 通知，同时向服务端发 Queued ACK
+		rejectMsg := "抱歉，我现在任务较多，无法接受新的请求，请稍后再试。"
+		logger.Warn("[Proxy] order queue full, rejecting request %s", edgeReq.RequestID)
+		go p.notifyUser(edgeReq, "status", rejectMsg, map[string]any{"stage": "rejected"})
+		go p.sendQuickACK(ctx, edgeReq) // 通知服务端停止等待（不存 DB）
+		p.orderCache.MarkRejected(edgeReq.RequestID)
+		return
+	}
+
+	order, err := p.orderCache.Add(edgeReq)
+	if err != nil {
+		logger.Error("[Proxy] failed to save order %s: %v", edgeReq.RequestID, err)
+		go p.notifyUser(edgeReq, "status", "内部错误，请重试。", map[string]any{"stage": "error"})
+		go p.sendQuickACK(ctx, edgeReq)
+		return
+	}
+
+	// 向用户发 SSE 状态通知（不存 DB），告知已收到请求
+	if order.Position == 0 {
+		go p.notifyUser(edgeReq, "status", "收到您的消息，马上为您处理...", map[string]any{"stage": "processing_start"})
+	} else {
+		queueMsg := fmt.Sprintf("收到您的消息，前面还有 %d 个请求，我会尽快处理，完成后通知您。", order.Position)
+		go p.notifyUser(edgeReq, "status", queueMsg, map[string]any{"stage": "queued", "position": order.Position})
+	}
+
+	// 向服务端发 Queued ACK，关闭服务端的等待（不存 DB）
+	go p.sendQuickACK(ctx, edgeReq)
+
+	// 派发给 Worker
+	p.orderCache.Dispatch(order)
+}
+
+// sendQuickACK 向服务端发送快速确认响应，告知服务端请求已进入本地队列。
+// 服务端收到后不保存消息到 DB，只向前端发送 "queued" 事件，前端等待后续 push 通知。
+// 状态通知（SSE）由调用方在调用此函数前通过 notifyUser 单独发送。
+func (p *Proxy) sendQuickACK(ctx context.Context, req *EdgeRequest) {
+	if req.Stream {
+		// stream 模式：推送 "queued" chunk，服务端不保存消息直接关闭流
+		writer, closer, err := p.streamResponse(ctx)
+		if err != nil {
+			logger.Warn("[Proxy] sendQuickACK(stream) open failed: %v", err)
+			// 降级：non-stream Queued ACK
+			p.submitResponse(ctx, &EdgeResponse{
+				RequestID: req.RequestID, AgentUUID: req.AgentUUID,
+				Success: true, Queued: true, Timestamp: time.Now(),
+			})
+			return
+		}
+		_ = writer(&EdgeStreamChunk{
+			RequestID: req.RequestID, AgentUUID: req.AgentUUID,
+			Type: "queued",
+		})
+		if err := closer(); err != nil {
+			logger.Warn("[Proxy] sendQuickACK(stream) close: %v", err)
+		}
+	} else {
+		// 非 stream：提交 Queued=true，服务端不保存消息
+		p.submitResponse(ctx, &EdgeResponse{
+			RequestID: req.RequestID, AgentUUID: req.AgentUUID,
+			Success: true, Queued: true, Timestamp: time.Now(),
+		})
+	}
+}
+
+// notifyUserSaveDB 调用 /edge/notify（带 save_to_db=true），
+// 服务端将消息持久化到 DB 并推送到 SSE，实现异步结果交付。
+func (p *Proxy) notifyUserSaveDB(ctx context.Context, req *EdgeRequest, content string, meta map[string]any) {
+	if req.SessionUUID == "" {
+		return
+	}
+	payload := map[string]any{
+		"agent_uuid":   req.AgentUUID,
+		"session_uuid": req.SessionUUID,
+		"type":         "result",
+		"content":      content,
+		"save_to_db":   true,
+	}
+	if len(meta) > 0 {
+		payload["metadata"] = meta
+	}
+	notifyCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	resp, err := p.doRequest(notifyCtx, "POST", "/api/v1/edge/notify", payload)
+	if err != nil {
+		logger.Warn("[Proxy] notifyUserSaveDB failed: %v", err)
+		return
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		logger.Warn("[Proxy] notifyUserSaveDB: server returned status %d", resp.StatusCode)
+	}
 }
 
 // buildLLMMessages 构建 LLM 消息列表，若有 attachments 则对最后一条 user 消息注入多模态内容
@@ -711,7 +914,7 @@ func (p *Proxy) handleRequest(ctx context.Context, req *EdgeRequest, sink respon
 		toolResults := p.toolExecutor.Execute(toolCtx, llmResp.ToolCalls)
 
 		// 检查 [NOTIFY] 前缀：工具要求直接推送通知给用户并终止循环
-		if shouldStop := p.handleToolNotify(req, toolResults); shouldStop {
+		if shouldStop := p.handleToolNotify(ctx, req, toolResults); shouldStop {
 			edgeResp.Success = true
 			edgeResp.Content = ""
 			submit(ctx, edgeResp)
@@ -1042,7 +1245,7 @@ func (p *Proxy) handleRequestStream(ctx context.Context, req *EdgeRequest) {
 		toolResults := p.toolExecutor.Execute(toolCtx, roundToolCalls)
 
 		// 检查 [NOTIFY] 前缀：工具要求直接推送通知给用户并终止循环
-		if shouldStop := p.handleToolNotify(req, toolResults); shouldStop {
+		if shouldStop := p.handleToolNotify(ctx, req, toolResults); shouldStop {
 			writer(&EdgeStreamChunk{
 				RequestID: req.RequestID, AgentUUID: req.AgentUUID,
 				Type: "done", Model: finalModel,
@@ -1110,17 +1313,26 @@ func (p *Proxy) handleRequestStream(ctx context.Context, req *EdgeRequest) {
 		req.RequestID, provider.Name(), finalModel, totalTokens, elapsed)
 }
 
+// notifyCaptureFn 是注入到 context 中的回调 key，供 Worker pool 捕获 [NOTIFY] 内容。
+type notifyCaptureFn struct{}
+
 // handleToolNotify 扫描工具执行结果中的 [NOTIFY] 前缀。
-// 若发现任意结果以 [NOTIFY] 开头，则立即将其内容推送给用户，并返回 true 表示应终止 LLM 循环。
-// 同时将结果内容中的前缀剥离，避免将原始标记暴露给 LLM。
-func (p *Proxy) handleToolNotify(req *EdgeRequest, results []llm.ToolResult) (shouldStop bool) {
+// 若发现，立即通过 SSE 推送给用户，并返回 true 表示应终止 LLM 循环。
+// 若 ctx 中注入了 notifyCaptureFn 回调（Worker pool 场景），还会额外调用回调，
+// 让调用方有机会将内容持久化到 DB。
+func (p *Proxy) handleToolNotify(ctx context.Context, req *EdgeRequest, results []llm.ToolResult) (shouldStop bool) {
 	const prefix = "[NOTIFY]"
 	for i, r := range results {
 		if strings.HasPrefix(r.Content, prefix) {
 			msg := strings.TrimPrefix(r.Content, prefix)
-			p.notifyUser(req, "status", msg, nil)
 			results[i].Content = msg
 			shouldStop = true
+			// 始终通过 SSE 发送即时通知（不存 DB）
+			p.notifyUser(req, "status", msg, nil)
+			// Worker pool 场景：通过 context 回调捕获内容，稍后存入 DB
+			if cb, ok := ctx.Value(notifyCaptureFn{}).(func(string)); ok {
+				cb(msg)
+			}
 		}
 	}
 	return

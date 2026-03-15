@@ -17,15 +17,23 @@ type Config struct {
 	EdgeToken string `yaml:"edge_token"` // Edge Token
 	AgentUUID string `yaml:"agent_uuid"` // Agent UUID
 
-	LLM     LLMConfig     `yaml:"llm"`     // LLM 配置
-	Rules   RulesConfig   `yaml:"rules"`   // Rules 配置
-	Skills  SkillsConfig  `yaml:"skills"`  // Skills 配置
-	MCP     MCPConfig     `yaml:"mcp"`     // MCP 配置
-	Sandbox SandboxConfig `yaml:"sandbox"` // Bash 沙箱配置（run_shell 工具）
+	LLM         LLMConfig         `yaml:"llm"`         // LLM 配置
+	Rules       RulesConfig       `yaml:"rules"`       // Rules 配置
+	Skills      SkillsConfig      `yaml:"skills"`      // Skills 配置
+	MCP         MCPConfig         `yaml:"mcp"`         // MCP 配置
+	Sandbox     SandboxConfig     `yaml:"sandbox"`     // Bash 沙箱配置（run_shell 工具）
+	Concurrency ConcurrencyConfig `yaml:"concurrency"` // 并发与本地队列配置
 
 	HeartbeatInterval time.Duration `yaml:"heartbeat_interval"` // 心跳间隔
 	PollTimeout       time.Duration `yaml:"poll_timeout"`       // 轮询超时
 	LogLevel          string        `yaml:"log_level"`          // 日志级别：debug, info, warn, error
+}
+
+// ConcurrencyConfig 并发与本地订单队列配置
+type ConcurrencyConfig struct {
+	MaxWorkers   int    `yaml:"max_workers"`    // 最大并发处理数，默认 2
+	MaxQueueSize int    `yaml:"max_queue_size"` // 本地等待队列最大容量（不含正在处理的），默认 10
+	DBPath       string `yaml:"db_path"`        // SQLite 数据库路径，默认 "./orders.db"
 }
 
 // RulesConfig Rules 文件配置
@@ -115,6 +123,11 @@ func Load(path string) (*Config, error) {
 		LLM: LLMConfig{
 			Temperature: 0.7,
 			MaxTokens:   4096,
+		},
+		Concurrency: ConcurrencyConfig{
+			MaxWorkers:   2,
+			MaxQueueSize: 10,
+			DBPath:       "./orders.db",
 		},
 	}
 

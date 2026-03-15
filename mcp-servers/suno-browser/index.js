@@ -31,6 +31,7 @@ const server = new Server({
 // 浏览器上下文和页面
 let context = null;
 let page = null;
+let contextIsHeadless = false;
 const USER_DATA_DIR = path.join(__dirname, '.chrome-data');
 
 /**
@@ -157,6 +158,7 @@ async function handleLogin() {
     console.error('[Suno] 正在启动浏览器...');
 
     context = await launchContext(false); // 登录时始终有头模式，让用户看到浏览器
+    contextIsHeadless = false;
 
     // 使用已有页面或创建新页面
     const pages = context.pages();
@@ -229,15 +231,22 @@ async function handleGenerate(args) {
   try {
     const prompt = args.prompt || '';
 
-    // 若无浏览器会话，自动启动
-    // 有持久化登录数据 → 无头模式（静默后台运行）
-    // 没有登录数据 → 有头模式（让用户看到浏览器完成登录）
+    // 若无浏览器会话，或当前会话是有头模式但已有登录数据，则重启为无头模式
+    const loginData = hasLoginData();
+    const needRelaunch = context && !contextIsHeadless && loginData;
+    if (needRelaunch) {
+      console.error('[Suno] 当前为有头模式，检测到已有登录数据，切换到无头模式...');
+      await context.close();
+      context = null;
+      page = null;
+    }
+
     if (!context || !page) {
-      const loginData = hasLoginData();
       const headless = loginData;
       console.error(`[Suno] 无浏览器会话，自动启动（headless=${headless}，loginData=${loginData}）...`);
       try {
         context = await launchContext(headless);
+        contextIsHeadless = headless;
         const pages = context.pages();
         page = pages.length > 0 ? pages[0] : await context.newPage();
         await page.goto('https://suno.ai', { waitUntil: 'networkidle', timeout: 30000 });
@@ -654,6 +663,7 @@ async function handleClose() {
       await context.close();
       context = null;
       page = null;
+      contextIsHeadless = false;
       console.error('[Suno] 浏览器已关闭');
     }
 
