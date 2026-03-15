@@ -915,6 +915,11 @@ func (p *Proxy) handleRequest(ctx context.Context, req *EdgeRequest, sink respon
 
 		// 检查 [NOTIFY] 前缀：工具要求直接推送通知给用户并终止循环
 		if shouldStop := p.handleToolNotify(ctx, req, toolResults); shouldStop {
+			for _, tc := range llmResp.ToolCalls {
+				p.notifyUser(req, "status", fmt.Sprintf("%s 执行完成", tc.Name),
+					map[string]any{"stage": "tool_done", "tool_name": tc.Name})
+			}
+			p.notifyUser(req, "status", "MCP调用结束", map[string]any{"stage": "mcp_done"})
 			edgeResp.Success = true
 			edgeResp.Content = ""
 			submit(ctx, edgeResp)
@@ -926,6 +931,7 @@ func (p *Proxy) handleRequest(ctx context.Context, req *EdgeRequest, sink respon
 			p.notifyUser(req, "status", fmt.Sprintf("%s 执行完成", tc.Name),
 				map[string]any{"stage": "tool_done", "tool_name": tc.Name})
 		}
+		p.notifyUser(req, "status", "MCP调用结束", map[string]any{"stage": "mcp_done"})
 
 		// 将 assistant 消息（含 tool_calls）追加到对话历史
 		// OpenAI 要求 tool 消息前必须有包含 tool_calls 的 assistant 消息
@@ -1246,6 +1252,11 @@ func (p *Proxy) handleRequestStream(ctx context.Context, req *EdgeRequest) {
 
 		// 检查 [NOTIFY] 前缀：工具要求直接推送通知给用户并终止循环
 		if shouldStop := p.handleToolNotify(ctx, req, toolResults); shouldStop {
+			for _, name := range toolNames {
+				p.notifyUser(req, "status", fmt.Sprintf("%s 执行完成", name),
+					map[string]any{"tool_name": name, "stage": "tool_done"})
+			}
+			p.notifyUser(req, "status", "MCP调用结束", map[string]any{"stage": "mcp_done"})
 			writer(&EdgeStreamChunk{
 				RequestID: req.RequestID, AgentUUID: req.AgentUUID,
 				Type: "done", Model: finalModel,
@@ -1263,6 +1274,7 @@ func (p *Proxy) handleRequestStream(ctx context.Context, req *EdgeRequest) {
 			p.notifyUser(req, "status", fmt.Sprintf("%s 执行完成", name),
 				map[string]any{"tool_name": name, "stage": "tool_done"})
 		}
+		p.notifyUser(req, "status", "MCP调用结束", map[string]any{"stage": "mcp_done"})
 
 		llmReq.Messages = append(llmReq.Messages, llm.Message{
 			Role: "assistant", Content: roundContent.String(), ToolCalls: roundToolCalls,

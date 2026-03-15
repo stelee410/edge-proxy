@@ -34,6 +34,9 @@ let page = null;
 let contextIsHeadless = false;
 const USER_DATA_DIR = path.join(__dirname, '.chrome-data');
 
+// 调试时使用有头模式，便于观察浏览器；上线可改为 false
+const FORCE_HEADED = true;
+
 /**
  * 列出可用工具
  */
@@ -42,7 +45,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
     tools: [
       {
         name: 'suno_login',
-        description: '打开 Suno 网页并显示浏览器窗口，供手动登录。首次使用必须先登录。',
+        description: '打开 Suno 网页并显示浏览器窗口，供用户手动登录。仅当 suno_generate 返回「未登录」时再调用；若用户已登录过，直接调用 suno_generate 即可。',
         inputSchema: {
           type: 'object',
           properties: {},
@@ -50,7 +53,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: 'suno_generate',
-        description: '在 Suno 中生成音乐。需要先调用 suno_login 登录。',
+        description: '在 Suno 中生成音乐。若用户已登录（曾完成过 suno_login 或浏览器已有会话）则直接生成；未登录时会返回提示，届时再调用 suno_login。用户说「生成/做一首歌」时优先直接调用本工具。',
         inputSchema: {
           type: 'object',
           properties: {
@@ -231,9 +234,9 @@ async function handleGenerate(args) {
   try {
     const prompt = args.prompt || '';
 
-    // 若无浏览器会话，或当前会话是有头模式但已有登录数据，则重启为无头模式
+    // 若无浏览器会话，或（未强制有头时）当前是有头且已有登录数据则重启为无头
     const loginData = hasLoginData();
-    const needRelaunch = context && !contextIsHeadless && loginData;
+    const needRelaunch = !FORCE_HEADED && context && !contextIsHeadless && loginData;
     if (needRelaunch) {
       console.error('[Suno] 当前为有头模式，检测到已有登录数据，切换到无头模式...');
       await context.close();
@@ -242,7 +245,7 @@ async function handleGenerate(args) {
     }
 
     if (!context || !page) {
-      const headless = loginData;
+      const headless = FORCE_HEADED ? false : loginData;
       console.error(`[Suno] 无浏览器会话，自动启动（headless=${headless}，loginData=${loginData}）...`);
       try {
         context = await launchContext(headless);
@@ -369,6 +372,8 @@ async function handleGenerate(args) {
       }],
       isError: true,
     };
+  } finally {
+    await closeBrowser();
   }
 }
 
@@ -490,6 +495,8 @@ async function handleGetShareLink() {
       }],
       isError: true,
     };
+  } finally {
+    await closeBrowser();
   }
 }
 
@@ -655,9 +662,9 @@ async function handleInspectPage() {
 }
 
 /**
- * 关闭浏览器
+ * 关闭浏览器并清理引用（工具/进程结束时调用）
  */
-async function handleClose() {
+async function closeBrowser() {
   try {
     if (context) {
       await context.close();
@@ -666,7 +673,17 @@ async function handleClose() {
       contextIsHeadless = false;
       console.error('[Suno] 浏览器已关闭');
     }
+  } catch (e) {
+    console.error('[Suno] 关闭浏览器时出错:', e?.message);
+  }
+}
 
+/**
+ * 关闭浏览器（suno_close 工具）
+ */
+async function handleClose() {
+  try {
+    await closeBrowser();
     return {
       content: [{
         type: 'text',
@@ -1076,19 +1093,24 @@ async function main() {
   console.error('[Suno] Browser MCP Server running on stdio (Playwright)');
 }
 
-main().catch((error) => {
+main().catch(async (error) => {
   console.error('[Suno] Fatal error:', error);
+  await closeBrowser();
   process.exit(1);
 });
 
-process.on('SIGINT', async () => {
-  console.error('[Suno] 收到中断信号，正在关闭...');
-  if (context) await context.close();
+let shuttingDown = false;
+async function shutdown() {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.error('[Suno] 正在关闭...');
+  await closeBrowser();
   process.exit(0);
-});
+}
 
-process.on('SIGTERM', async () => {
-  console.error('[Suno] 收到终止信号，正在关闭...');
-  if (context) await context.close();
-  process.exit(0);
-});
+process.on('SIGINT', shutdown);
+process.on('SIGTERM', shutdown);
+
+// 父进程关闭 stdin 时（如 edge-proxy 退出）关闭浏览器并退出
+process.stdin.on('end', shutdown);
+process.stdin.on('close', shutdown);
